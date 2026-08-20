@@ -43,8 +43,9 @@ jobs:
           push: true
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
-          cache-from: type=registry,ref=${{ env.DOCKERHUB_IMAGE }}:buildcache
-          cache-to: type=registry,ref=${{ env.DOCKERHUB_IMAGE }}:buildcache,mode=max
+          cache-from: ${{ !inputs.no_cache && 'type=gha' || '' }},scope=docker-publish
+          cache-to: type=gha,scope=docker-publish,mode=max
+
           platforms: linux/amd64,linux/arm64
           provenance: false
           sbom: false
