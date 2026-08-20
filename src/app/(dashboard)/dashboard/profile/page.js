@@ -658,6 +658,21 @@ export default function ProfilePage() {
     }
   };
 
+  const updateInfoFromModelsDev = async (infoFromModelsDev) => {
+    try {
+      const res = await fetch("/api/settings", {
+        method: "PATCH",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ infoFromModelsDev }),
+      });
+      if (res.ok) {
+        setSettings(prev => ({ ...prev, infoFromModelsDev }));
+      }
+    } catch (err) {
+      console.error("Failed update infoFromModelsDev:", err);
+    }
+  };
+
   const reloadSettings = async () => {
     try {
       const res = await fetch("/api/settings");
@@ -1463,6 +1478,19 @@ export default function ProfilePage() {
               <Toggle
                 checked={settings.exposeComboOnly === true}
                 onChange={() => updateExposeComboOnly(!settings.exposeComboOnly)}
+                disabled={loading}
+              />
+            </div>
+            <div className="flex items-start sm:items-center justify-between gap-4">
+              <div className="flex-1 min-w-0">
+                <p className="font-medium text-sm sm:text-base">Info From models.dev</p>
+                <p className="text-xs sm:text-sm text-text-muted">
+                  Enrich Combo entries with metadata from models.dev in <code className="bg-bg px-1 rounded text-xs">/v1/models</code>
+                </p>
+              </div>
+              <Toggle
+                checked={settings.infoFromModelsDev === true}
+                onChange={() => updateInfoFromModelsDev(!settings.infoFromModelsDev)}
                 disabled={loading}
               />
             </div>

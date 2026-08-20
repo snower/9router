@@ -19,6 +19,7 @@ import { resolveZedModels } from "open-sse/shared/zedAuth.js";
 import { updateProviderCredentials } from "@/sse/services/tokenRefresh";
 import { resolveConnectionProxyConfig } from "@/lib/network/connectionProxy";
 import { capabilitiesFromServiceKind, getCapabilitiesForModel } from "open-sse/providers/capabilities.js";
+import { findMetadataByName } from "@/lib/modelsDevService.js";
 
 // Per-provider live model resolvers. Each receives a connection record and
 // returns { models: [{ id, name? }, ...] } | null on failure.
@@ -250,6 +251,29 @@ function comboToEntry(combo) {
   return entry;
 }
 
+const METADATA_WHITELIST = [
+  "name", "description", "family", "attachment", "reasoning",
+  "tool_call", "structured_output", "temperature", "knowledge",
+  "release_date", "last_updated", "modalities", "open_weights",
+  "limit", "license", "links", "weights", "benchmarks", "status",
+];
+
+async function enrichComboEntry(entry) {
+  try {
+    const record = await findMetadataByName(entry.id);
+    if (!record) return entry;
+    entry.models_dev_id = record.id;
+    for (const key of METADATA_WHITELIST) {
+      if (record[key] !== undefined) {
+        entry[key] = record[key];
+      }
+    }
+  } catch {
+    // fail-open: leave entry untouched
+  }
+  return entry;
+}
+
 /**
  * Build OpenAI-format models list filtered by service kinds.
  * @param {string[]} kindFilter - List of service kinds to include (e.g. ["llm"], ["webSearch","webFetch"]).
@@ -283,9 +307,11 @@ export async function buildModelsList(kindFilter, options = {}) {
   if (settings.exposeComboOnly) {
     const seenModelIds = new Set();
     const comboOnlyModels = [];
+    const enrich = settings.infoFromModelsDev === true;
     for (const combo of combos) {
       if (!comboMatchesKinds(combo, kindFilter)) continue;
-      const entry = comboToEntry(combo);
+      let entry = comboToEntry(combo);
+      if (enrich) entry = await enrichComboEntry(entry);
       if (seenModelIds.has(entry.id)) continue;
       seenModelIds.add(entry.id);
       comboOnlyModels.push(entry);
@@ -325,9 +351,12 @@ export async function buildModelsList(kindFilter, options = {}) {
   const models = [];
 
   // Combos first (filtered by kind). Web combos expose `kind` so AI knows search vs fetch.
+  const enrich = settings.infoFromModelsDev === true;
   for (const combo of combos) {
     if (!comboMatchesKinds(combo, kindFilter)) continue;
-    models.push(comboToEntry(combo));
+    let entry = comboToEntry(combo);
+    if (enrich) entry = await enrichComboEntry(entry);
+    models.push(entry);
   }
 
   if (connections.length === 0) {
