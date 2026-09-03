@@ -87,3 +87,5 @@ graphify-out/*
 .PR/
 .next-analyze/*
 .sisyphus
+# Kiro local workspace state
+.kiro/
