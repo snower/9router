@@ -1,12 +1,13 @@
 "use client";
 
-import { useState, useEffect, useCallback } from "react";
+import { useState, useEffect, useCallback, useRef } from "react";
 import Card from "@/shared/components/Card";
 import Button from "@/shared/components/Button";
 import Drawer from "@/shared/components/Drawer";
 import Pagination from "@/shared/components/Pagination";
 import { cn } from "@/shared/utils/cn";
 import { AI_PROVIDERS, getProviderByAlias } from "@/shared/constants/providers";
+import { fetchDetailById, createEnrichmentState } from "./useDetailEnrichment";
 
 let providerNameCache = null;
 let providerNodesCache = null;
@@ -110,6 +111,9 @@ export default function RequestDetailsTab() {
   const [loading, setLoading] = useState(false);
   const [selectedDetail, setSelectedDetail] = useState(null);
   const [isDrawerOpen, setIsDrawerOpen] = useState(false);
+  const [detailLoading, setDetailLoading] = useState(false);
+  const enrichmentRef = useRef(createEnrichmentState());
+  const selectedDetailId = selectedDetail?.id;
   const [providers, setProviders] = useState([]);
   const [providerNameCache, setProviderNameCache] = useState(null);
   const [filters, setFilters] = useState({
@@ -162,9 +166,38 @@ export default function RequestDetailsTab() {
     fetchDetails();
   }, [fetchDetails]);
 
+  useEffect(() => {
+    if (!selectedDetailId || !isDrawerOpen) return;
+
+    const enrichment = enrichmentRef.current;
+    const { seq, signal } = enrichment.start({ id: selectedDetailId });
+
+    fetchDetailById(selectedDetailId, { signal })
+      .then((enriched) => {
+        if (enriched && enrichment.isCurrent(seq)) {
+          setSelectedDetail(enriched);
+        }
+      })
+      .finally(() => {
+        if (enrichment.isCurrent(seq)) {
+          setDetailLoading(false);
+        }
+      });
+
+    return () => {
+      enrichment.cancel();
+    };
+  }, [selectedDetailId, isDrawerOpen]);
+
   const handleViewDetail = (detail) => {
+    setDetailLoading(true);
     setSelectedDetail(detail);
     setIsDrawerOpen(true);
+  };
+
+  const handleCloseDrawer = () => {
+    setIsDrawerOpen(false);
+    setDetailLoading(false);
   };
 
   const handlePageChange = (newPage) => {
@@ -297,21 +330,21 @@ export default function RequestDetailsTab() {
                        </span>
                      </td>
                     <td className="p-4 text-sm text-text-main text-right font-mono">
-                      {getInputTokens(detail.tokens).toLocaleString()}
+                      {detail.detailUnavailable ? "\u2014" : getInputTokens(detail.tokens).toLocaleString()}
                     </td>
                     <td className="p-4 text-sm text-text-main text-right font-mono">
-                      {getCachedTokens(detail.tokens) > 0 ? getCachedTokens(detail.tokens).toLocaleString() : "—"}
+                      {detail.detailUnavailable ? "\u2014" : (getCachedTokens(detail.tokens) > 0 ? getCachedTokens(detail.tokens).toLocaleString() : "\u2014")}
                     </td>
                     <td className="p-4 text-sm text-text-main text-right font-mono">
-                      {getCacheCreationTokens(detail.tokens) > 0 ? getCacheCreationTokens(detail.tokens).toLocaleString() : "—"}
+                      {detail.detailUnavailable ? "\u2014" : (getCacheCreationTokens(detail.tokens) > 0 ? getCacheCreationTokens(detail.tokens).toLocaleString() : "\u2014")}
                     </td>
                     <td className="p-4 text-sm text-text-main text-right font-mono">
-                      {detail.tokens?.completion_tokens?.toLocaleString() || 0}
+                      {detail.detailUnavailable ? "\u2014" : (detail.tokens?.completion_tokens?.toLocaleString() || 0)}
                     </td>
                     <td className="p-4 text-sm text-text-muted">
                       <div className="flex flex-col gap-0.5">
-                        <div>TTFT: <span className="font-mono">{detail.latency?.ttft || 0}ms</span></div>
-                        <div>Total: <span className="font-mono">{detail.latency?.total || 0}ms</span></div>
+                        <div>TTFT: <span className="font-mono">{detail.detailUnavailable ? "\u2014" : (detail.latency?.ttft || 0)}ms</span></div>
+                        <div>Total: <span className="font-mono">{detail.detailUnavailable ? "\u2014" : (detail.latency?.total || 0)}ms</span></div>
                       </div>
                     </td>
                     <td className="p-4 text-center">
@@ -345,11 +378,16 @@ export default function RequestDetailsTab() {
 
       <Drawer
         isOpen={isDrawerOpen}
-        onClose={() => setIsDrawerOpen(false)}
+        onClose={handleCloseDrawer}
         title="Request Details"
-        width="lg"
+        width="xl"
       >
-        {selectedDetail && (
+        {detailLoading ? (
+          <div className="flex flex-col items-center justify-center gap-2 py-16 text-text-muted">
+            <span className="material-symbols-outlined animate-spin text-[24px]">progress_activity</span>
+            <span className="text-sm">Loading request details...</span>
+          </div>
+        ) : selectedDetail && (
           <div className="space-y-6">
             <div className="grid min-w-0 grid-cols-1 gap-4 text-sm sm:grid-cols-2">
               <div>
@@ -456,51 +494,70 @@ export default function RequestDetailsTab() {
             )}
 
             <div className="space-y-4">
-              <CollapsibleSection title="1. Client Request (Input)" defaultOpen={true} icon="input">
-                <pre className="max-h-[300px] max-w-full overflow-auto rounded-lg border border-black/5 bg-black/5 p-3 font-mono text-xs text-text-main dark:border-white/5 dark:bg-white/5 sm:p-4">
-                  {JSON.stringify(selectedDetail.request, null, 2)}
-                </pre>
-              </CollapsibleSection>
-
-              {selectedDetail.providerRequest && (
-                <CollapsibleSection title="2. Provider Request (Translated)" icon="translate">
-                  <pre className="max-h-[300px] max-w-full overflow-auto rounded-lg border border-black/5 bg-black/5 p-3 font-mono text-xs text-text-main dark:border-white/5 dark:bg-white/5 sm:p-4">
-                    {JSON.stringify(selectedDetail.providerRequest, null, 2)}
-                  </pre>
-                </CollapsibleSection>
-              )}
-
-              {selectedDetail.providerResponse && (
-                <CollapsibleSection title="3. Provider Response (Raw)" icon="data_object">
-                  <pre className="max-h-[300px] max-w-full overflow-auto rounded-lg border border-black/5 bg-black/5 p-3 font-mono text-xs text-text-main dark:border-white/5 dark:bg-white/5 sm:p-4">
-                    {typeof selectedDetail.providerResponse === 'object'
-                      ? JSON.stringify(selectedDetail.providerResponse, null, 2)
-                      : selectedDetail.providerResponse
-                    }
-                  </pre>
-                </CollapsibleSection>
-              )}
-              
-              <CollapsibleSection title="4. Client Response (Final)" defaultOpen={true} icon="output">
-                {selectedDetail.response?.thinking && (
-                  <div className="mb-4">
-                    <h4 className="font-semibold text-text-main mb-2 flex items-center gap-2 text-xs uppercase tracking-wide opacity-70">
-                      <span className="material-symbols-outlined text-[16px]">psychology</span>
-                      Thinking Process
-                    </h4>
-                    <pre className="max-h-[200px] max-w-full overflow-auto rounded-lg border border-amber-200 bg-amber-50 p-3 font-mono text-xs text-amber-900 dark:border-amber-800 dark:bg-amber-950/30 dark:text-amber-100 sm:p-4">
-                      {selectedDetail.response.thinking}
-                    </pre>
+              {selectedDetail.detailUnavailable ? (
+                <div className="rounded-lg border border-amber-200 bg-amber-50 p-4 dark:border-amber-800 dark:bg-amber-950/30">
+                  <div className="flex items-center gap-2 mb-2">
+                    <span className="material-symbols-outlined text-[18px] text-amber-600">info</span>
+                    <span className="font-semibold text-sm text-amber-800 dark:text-amber-200">Detail Unavailable</span>
                   </div>
-                )}
-                
-                <h4 className="font-semibold text-text-main mb-2 text-xs uppercase tracking-wide opacity-70">
-                  Content
-                </h4>
-                <pre className="max-h-[300px] max-w-full overflow-auto rounded-lg border border-black/5 bg-black/5 p-3 font-mono text-xs text-text-main dark:border-white/5 dark:bg-white/5 sm:p-4">
-                  {selectedDetail.response?.content || "[No content]"}
-                </pre>
-              </CollapsibleSection>
+                  <p className="text-sm text-amber-700 dark:text-amber-300">
+                    Full request response details are no longer available for this record.
+                  </p>
+                  {selectedDetail.detailError && (
+                    <p className="mt-2 text-xs text-amber-600 dark:text-amber-400 font-mono">
+                      {selectedDetail.detailError}
+                    </p>
+                  )}
+                </div>
+              ) : (
+                <>
+                  <CollapsibleSection title="1. Client Request (Input)" defaultOpen={true} icon="input">
+                    <pre className="max-h-[300px] max-w-full overflow-auto rounded-lg border border-black/5 bg-black/5 p-3 font-mono text-xs text-text-main dark:border-white/5 dark:bg-white/5 sm:p-4">
+                      {JSON.stringify(selectedDetail.request, null, 2)}
+                    </pre>
+                  </CollapsibleSection>
+
+                  {selectedDetail.providerRequest && (
+                    <CollapsibleSection title="2. Provider Request (Translated)" icon="translate">
+                      <pre className="max-h-[300px] max-w-full overflow-auto rounded-lg border border-black/5 bg-black/5 p-3 font-mono text-xs text-text-main dark:border-white/5 dark:bg-white/5 sm:p-4">
+                        {JSON.stringify(selectedDetail.providerRequest, null, 2)}
+                      </pre>
+                    </CollapsibleSection>
+                  )}
+
+                  {selectedDetail.providerResponse && (
+                    <CollapsibleSection title="3. Provider Response (Raw)" icon="data_object">
+                      <pre className="max-h-[300px] max-w-full overflow-auto rounded-lg border border-black/5 bg-black/5 p-3 font-mono text-xs text-text-main dark:border-white/5 dark:bg-white/5 sm:p-4">
+                        {typeof selectedDetail.providerResponse === 'object'
+                          ? JSON.stringify(selectedDetail.providerResponse, null, 2)
+                          : selectedDetail.providerResponse
+                        }
+                      </pre>
+                    </CollapsibleSection>
+                  )}
+                  
+                  <CollapsibleSection title="4. Client Response (Final)" defaultOpen={true} icon="output">
+                    {selectedDetail.response?.thinking && (
+                      <div className="mb-4">
+                        <h4 className="font-semibold text-text-main mb-2 flex items-center gap-2 text-xs uppercase tracking-wide opacity-70">
+                          <span className="material-symbols-outlined text-[16px]">psychology</span>
+                          Thinking Process
+                        </h4>
+                        <pre className="max-h-[200px] max-w-full overflow-auto rounded-lg border border-amber-200 bg-amber-50 p-3 font-mono text-xs text-amber-900 dark:border-amber-800 dark:bg-amber-950/30 dark:text-amber-100 sm:p-4">
+                          {selectedDetail.response.thinking}
+                        </pre>
+                      </div>
+                    )}
+                    
+                    <h4 className="font-semibold text-text-main mb-2 text-xs uppercase tracking-wide opacity-70">
+                      Content
+                    </h4>
+                    <pre className="max-h-[300px] max-w-full overflow-auto rounded-lg border border-black/5 bg-black/5 p-3 font-mono text-xs text-text-main dark:border-white/5 dark:bg-white/5 sm:p-4">
+                      {selectedDetail.response?.content || "[No content]"}
+                    </pre>
+                  </CollapsibleSection>
+                </>
+              )}
             </div>
           </div>
         )}
