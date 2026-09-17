@@ -128,7 +128,7 @@ async function createDefaultAdapter() {
               return dataset.readLatest();
             },
             async flush() {
-              dataset.flush();
+              
             },
             async close() {
               dataset.close();
