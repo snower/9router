@@ -1,12 +1,13 @@
 "use client";
 
-import { useState, useEffect, useCallback } from "react";
+import { useState, useEffect, useCallback, useRef } from "react";
 import Card from "@/shared/components/Card";
 import Button from "@/shared/components/Button";
 import Drawer from "@/shared/components/Drawer";
 import Pagination from "@/shared/components/Pagination";
 import { cn } from "@/shared/utils/cn";
 import { AI_PROVIDERS, getProviderByAlias } from "@/shared/constants/providers";
+import { fetchDetailById, createEnrichmentState } from "./useDetailEnrichment";
 
 let providerNameCache = null;
 let providerNodesCache = null;
@@ -110,6 +111,9 @@ export default function RequestDetailsTab() {
   const [loading, setLoading] = useState(false);
   const [selectedDetail, setSelectedDetail] = useState(null);
   const [isDrawerOpen, setIsDrawerOpen] = useState(false);
+  const [detailLoading, setDetailLoading] = useState(false);
+  const enrichmentRef = useRef(createEnrichmentState());
+  const selectedDetailId = selectedDetail?.id;
   const [providers, setProviders] = useState([]);
   const [providerNameCache, setProviderNameCache] = useState(null);
   const [filters, setFilters] = useState({
@@ -162,9 +166,38 @@ export default function RequestDetailsTab() {
     fetchDetails();
   }, [fetchDetails]);
 
+  useEffect(() => {
+    if (!selectedDetailId || !isDrawerOpen) return;
+
+    const enrichment = enrichmentRef.current;
+    const { seq, signal } = enrichment.start({ id: selectedDetailId });
+
+    fetchDetailById(selectedDetailId, { signal })
+      .then((enriched) => {
+        if (enriched && enrichment.isCurrent(seq)) {
+          setSelectedDetail(enriched);
+        }
+      })
+      .finally(() => {
+        if (enrichment.isCurrent(seq)) {
+          setDetailLoading(false);
+        }
+      });
+
+    return () => {
+      enrichment.cancel();
+    };
+  }, [selectedDetailId, isDrawerOpen]);
+
   const handleViewDetail = (detail) => {
+    setDetailLoading(true);
     setSelectedDetail(detail);
     setIsDrawerOpen(true);
+  };
+
+  const handleCloseDrawer = () => {
+    setIsDrawerOpen(false);
+    setDetailLoading(false);
   };
 
   const handlePageChange = (newPage) => {
@@ -345,11 +378,16 @@ export default function RequestDetailsTab() {
 
       <Drawer
         isOpen={isDrawerOpen}
-        onClose={() => setIsDrawerOpen(false)}
+        onClose={handleCloseDrawer}
         title="Request Details"
-        width="lg"
+        width="xl"
       >
-        {selectedDetail && (
+        {detailLoading ? (
+          <div className="flex flex-col items-center justify-center gap-2 py-16 text-text-muted">
+            <span className="material-symbols-outlined animate-spin text-[24px]">progress_activity</span>
+            <span className="text-sm">Loading request details...</span>
+          </div>
+        ) : selectedDetail && (
           <div className="space-y-6">
             <div className="grid min-w-0 grid-cols-1 gap-4 text-sm sm:grid-cols-2">
               <div>
