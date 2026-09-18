@@ -8,6 +8,8 @@ import Pagination from "@/shared/components/Pagination";
 import { cn } from "@/shared/utils/cn";
 import { AI_PROVIDERS, getProviderByAlias } from "@/shared/constants/providers";
 import { fetchDetailById, createEnrichmentState } from "./useDetailEnrichment";
+import RequestMessageAnalysisModal from "./RequestMessageAnalysisModal";
+import { hasAnalyzableRequestMessages } from "./requestMessageAnalysis";
 
 let providerNameCache = null;
 let providerNodesCache = null;
@@ -52,27 +54,34 @@ function getProviderName(providerId, cache) {
   return providerConfig?.name || providerId;
 }
 
-function CollapsibleSection({ title, children, defaultOpen = false, icon = null }) {
+function CollapsibleSection({ title, children, defaultOpen = false, icon = null, action = null }) {
   const [isOpen, setIsOpen] = useState(defaultOpen);
   
   return (
     <div className="border border-black/5 dark:border-white/5 rounded-lg overflow-hidden">
-      <button 
-        type="button"
-        onClick={() => setIsOpen(!isOpen)}
-        className="w-full flex items-center justify-between p-3 bg-black/[0.02] dark:bg-white/[0.02] hover:bg-black/[0.04] dark:hover:bg-white/[0.04] transition-colors"
-      >
-        <div className="flex items-center gap-2">
-          {icon && <span className="material-symbols-outlined text-[18px] text-text-muted">{icon}</span>}
-          <span className="font-semibold text-sm text-text-main">{title}</span>
-        </div>
-        <span className={cn(
-          "material-symbols-outlined text-[20px] text-text-muted transition-transform duration-200",
-          isOpen ? "rotate-90" : ""
-        )}>
-          chevron_right
-        </span>
-      </button>
+      <div className="flex items-stretch bg-black/[0.02] dark:bg-white/[0.02]">
+        <button
+          type="button"
+          onClick={() => setIsOpen(!isOpen)}
+          className="flex min-w-0 flex-1 items-center justify-between p-3 hover:bg-black/[0.04] dark:hover:bg-white/[0.04] transition-colors"
+        >
+          <div className="flex items-center gap-2">
+            {icon && <span className="material-symbols-outlined text-[18px] text-text-muted">{icon}</span>}
+            <span className="font-semibold text-sm text-text-main">{title}</span>
+          </div>
+          <span className={cn(
+            "material-symbols-outlined text-[20px] text-text-muted transition-transform duration-200",
+            isOpen ? "rotate-90" : ""
+          )}>
+            chevron_right
+          </span>
+        </button>
+        {action && (
+          <div className="flex items-center pr-3">
+            {action}
+          </div>
+        )}
+      </div>
       
       {isOpen && (
         <div className="p-4 border-t border-black/5 dark:border-white/5">
@@ -111,8 +120,12 @@ export default function RequestDetailsTab() {
   const [loading, setLoading] = useState(false);
   const [selectedDetail, setSelectedDetail] = useState(null);
   const [isDrawerOpen, setIsDrawerOpen] = useState(false);
+  const [isAnalysisOpen, setIsAnalysisOpen] = useState(false);
   const [detailLoading, setDetailLoading] = useState(false);
   const enrichmentRef = useRef(createEnrichmentState());
+  // Deferred drawer restoration: the analysis Modal must finish its body
+  // overflow cleanup before the Drawer re-claims it. Cancellable via ref.
+  const restoreDrawerTimerRef = useRef(null);
   const selectedDetailId = selectedDetail?.id;
   const [providers, setProviders] = useState([]);
   const [providerNameCache, setProviderNameCache] = useState(null);
@@ -190,15 +203,59 @@ export default function RequestDetailsTab() {
   }, [selectedDetailId, isDrawerOpen]);
 
   const handleViewDetail = (detail) => {
+    if (restoreDrawerTimerRef.current !== null) {
+      clearTimeout(restoreDrawerTimerRef.current);
+      restoreDrawerTimerRef.current = null;
+    }
     setDetailLoading(true);
     setSelectedDetail(detail);
     setIsDrawerOpen(true);
+    setIsAnalysisOpen(false);
   };
 
   const handleCloseDrawer = () => {
+    if (restoreDrawerTimerRef.current !== null) {
+      clearTimeout(restoreDrawerTimerRef.current);
+      restoreDrawerTimerRef.current = null;
+    }
     setIsDrawerOpen(false);
     setDetailLoading(false);
+    setIsAnalysisOpen(false);
   };
+
+  // Shared Drawer and Modal each bind document Escape + body overflow, so only
+  // one may be active: opening analysis suspends the Drawer (keeping the selected
+  // detail) and closing analysis restores it.
+  const handleOpenAnalysis = () => {
+    if (restoreDrawerTimerRef.current !== null) {
+      clearTimeout(restoreDrawerTimerRef.current);
+      restoreDrawerTimerRef.current = null;
+    }
+    setIsDrawerOpen(false);
+    setIsAnalysisOpen(true);
+  };
+
+  const handleCloseAnalysis = () => {
+    if (restoreDrawerTimerRef.current !== null) {
+      clearTimeout(restoreDrawerTimerRef.current);
+      restoreDrawerTimerRef.current = null;
+    }
+    setIsAnalysisOpen(false);
+    if (!selectedDetail) return;
+    // Defer so the Modal unmount commit (and its body overflow cleanup) runs
+    // before the Drawer effect re-claims body overflow. Never mount both at once.
+    restoreDrawerTimerRef.current = setTimeout(() => {
+      restoreDrawerTimerRef.current = null;
+      setIsDrawerOpen(true);
+    }, 0);
+  };
+
+  useEffect(() => () => {
+    if (restoreDrawerTimerRef.current !== null) {
+      clearTimeout(restoreDrawerTimerRef.current);
+      restoreDrawerTimerRef.current = null;
+    }
+  }, []);
 
   const handlePageChange = (newPage) => {
     setPagination(prev => ({ ...prev, page: newPage }));
@@ -511,7 +568,22 @@ export default function RequestDetailsTab() {
                 </div>
               ) : (
                 <>
-                  <CollapsibleSection title="1. Client Request (Input)" defaultOpen={true} icon="input">
+                  <CollapsibleSection
+                    title="1. Client Request (Input)"
+                    defaultOpen={true}
+                    icon="input"
+                    action={hasAnalyzableRequestMessages({ request: selectedDetail.request }) ? (
+                      <button
+                        type="button"
+                        onClick={handleOpenAnalysis}
+                        className="flex h-8 w-8 items-center justify-center rounded-md text-text-muted transition-colors hover:bg-black/[0.06] hover:text-text-main dark:hover:bg-white/[0.08]"
+                        title="Analyze request messages"
+                        aria-label="Analyze request messages"
+                      >
+                        <span className="material-symbols-outlined text-[18px]">analytics</span>
+                      </button>
+                    ) : null}
+                  >
                     <pre className="max-h-[300px] max-w-full overflow-auto rounded-lg border border-black/5 bg-black/5 p-3 font-mono text-xs text-text-main dark:border-white/5 dark:bg-white/5 sm:p-4">
                       {JSON.stringify(selectedDetail.request, null, 2)}
                     </pre>
@@ -562,6 +634,14 @@ export default function RequestDetailsTab() {
           </div>
         )}
       </Drawer>
+
+      {selectedDetail && (
+        <RequestMessageAnalysisModal
+          isOpen={isAnalysisOpen}
+          onClose={handleCloseAnalysis}
+          request={selectedDetail.request}
+        />
+      )}
     </div>
   );
 }
