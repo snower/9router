@@ -27,9 +27,9 @@ const BLOCK_BADGE_STYLES = {
 
 const BLOCK_LABELS = {
   text: "Text",
-  tool_call: "Tool call",
-  tool_use: "Tool use",
-  tool_result: "Tool result",
+  tool_call: "Tool Call",
+  tool_use: "Tool Use",
+  tool_result: "Tool Result",
 };
 
 function roleBadgeClass(role) {
@@ -48,30 +48,53 @@ function roleLabel(role) {
   return role && role.length > 0 ? role : "unknown";
 }
 
-function BlockList({ blocks }) {
+function BlockList({ blocks, showSource = false }) {
   return (
     <div className="flex flex-col gap-3">
       {blocks.map((block, index) => (
         <div key={index} className="flex flex-col gap-1.5">
-          <span
-            className={cn(
-              "inline-flex w-fit rounded-full px-2 py-0.5 text-[10px] font-semibold",
-              blockBadgeClass(block.type)
-            )}
-          >
-            {blockLabel(block.type)}
-          </span>
-          <BlockContent block={block} />
+          {block.type !== "text" && (
+            <span
+              className={cn(
+                "inline-flex w-fit rounded-full px-2 py-0.5 text-[10px] font-semibold",
+                blockBadgeClass(block.type)
+              )}
+            >
+              {blockLabel(block.type)}
+            </span>
+          )}
+          <BlockContent block={block} showSource={showSource} />
         </div>
       ))}
     </div>
   );
 }
 
-function BlockContent({ block }) {
+// Source mode renders the raw provider text verbatim: React escapes the string
+// by default and there is no markdown parsing, so this can never mount HTML.
+function RequestMessageSourceText({ text, className }) {
+  if (typeof text !== "string" || text.trim().length === 0) return null;
+
+  return (
+    <pre
+      className={cn(
+        "whitespace-pre-wrap break-words font-mono text-xs leading-relaxed text-text-main",
+        className
+      )}
+    >
+      {text}
+    </pre>
+  );
+}
+
+function BlockContent({ block, showSource = false }) {
   switch (block.type) {
     case "text":
-      return <RequestMessageText text={block.text} />;
+      return showSource ? (
+        <RequestMessageSourceText text={block.text} />
+      ) : (
+        <RequestMessageText text={block.text} />
+      );
     case "tool_call":
       return (
         <div className="flex flex-col gap-1">
@@ -205,6 +228,10 @@ export default function RequestMessageAnalysisModal({ isOpen, onClose, request }
 
   const [activeRole, setActiveRole] = useState("all");
   const [activeIndex, setActiveIndex] = useState(null);
+  // Separate flag: closing the full-window preview must not reset the
+  // caller's activeRole/activeIndex (filter + message selection).
+  const [isFullscreenOpen, setIsFullscreenOpen] = useState(false);
+  const [isSourceMode, setIsSourceMode] = useState(false);
 
   const filteredMessages = useMemo(() => {
     if (activeRole === "all") return messages;
@@ -223,14 +250,64 @@ export default function RequestMessageAnalysisModal({ isOpen, onClose, request }
     setActiveIndex(null);
   };
 
+  // Escape/Close from fullscreen returns to analysis (keeping activeRole/activeIndex); otherwise delegate to parent.
+  const handleModalClose = () => {
+    if (isFullscreenOpen) {
+      setIsFullscreenOpen(false);
+      setIsSourceMode(false);
+      return;
+    }
+    onClose();
+  };
+
+  const handleOpenFullscreen = () => {
+    setIsSourceMode(false);
+    setIsFullscreenOpen(true);
+  };
+
+  const isImmersive = isFullscreenOpen && Boolean(selectedMessage);
+
   return (
     <Modal
       isOpen={isOpen}
-      onClose={onClose}
+      onClose={handleModalClose}
       title="Request message analysis"
       size="full"
+      immersive={isImmersive}
+      className="max-w-[min(1400px,95vw)]!"
     >
-      {!hasMessages ? (
+      {isImmersive ? (
+        <>
+          <button
+            type="button"
+            onClick={handleModalClose}
+            className="fixed right-4 top-4 z-10 flex h-9 w-9 items-center justify-center rounded-full border border-black/10 bg-surface/80 text-text-muted backdrop-blur transition-colors hover:bg-surface-2 hover:text-text-main dark:border-white/10 sm:right-6 sm:top-6"
+            title="Exit full window"
+            aria-label="Exit full window"
+          >
+            <span className="material-symbols-outlined text-[20px]">close</span>
+          </button>
+          <button
+            type="button"
+            onClick={() => setIsSourceMode((current) => !current)}
+            className="fixed bottom-4 right-4 z-10 flex h-9 w-9 items-center justify-center rounded-full border border-black/10 bg-surface/80 text-text-muted backdrop-blur transition-colors hover:bg-surface-2 hover:text-text-main dark:border-white/10 sm:bottom-6 sm:right-6"
+            title={isSourceMode ? "View rendered Markdown" : "View source text"}
+            aria-label={isSourceMode ? "View rendered Markdown" : "View source text"}
+          >
+            <span className="material-symbols-outlined text-[20px]">
+              {isSourceMode ? "markdown" : "code"}
+            </span>
+          </button>
+          <div className="flex h-full flex-col overflow-y-auto custom-scrollbar">
+            <div className="mx-auto w-full max-w-[78vw] px-5 pb-20 pt-8 sm:px-8">
+              <BlockList
+                blocks={selectedMessage.blocks}
+                showSource={isSourceMode}
+              />
+            </div>
+          </div>
+        </>
+      ) : !hasMessages ? (
         <div className="flex flex-col items-center gap-2 py-12 text-center text-text-muted">
           <span className="material-symbols-outlined text-[28px]">
             chat_bubble
@@ -248,8 +325,8 @@ export default function RequestMessageAnalysisModal({ isOpen, onClose, request }
             total={stats.messageCount}
           />
 
-          <div className="grid grid-cols-1 gap-4 lg:grid-cols-[minmax(0,300px)_minmax(0,1fr)]">
-            <div className="flex max-h-[45vh] flex-col gap-2 overflow-y-auto pr-1 custom-scrollbar lg:max-h-[calc(85vh-320px)]">
+          <div className="grid grid-cols-1 gap-4 lg:grid-cols-[minmax(0,320px)_minmax(0,1fr)]">
+            <div className="flex max-h-[45vh] flex-col gap-2 overflow-y-auto pr-1 custom-scrollbar lg:max-h-[calc(90vh-300px)]">
               {filteredMessages.map((message) => (
                 <MessageListItem
                   key={message.index}
@@ -260,10 +337,10 @@ export default function RequestMessageAnalysisModal({ isOpen, onClose, request }
               ))}
             </div>
 
-            <div className="min-w-0 rounded-lg border border-black/5 p-4 dark:border-white/5">
+            <div className="flex min-h-[45vh] max-h-[calc(85vh-260px)] min-w-0 flex-col rounded-lg border border-black/5 dark:border-white/5 lg:max-h-[calc(90vh-300px)]">
               {selectedMessage ? (
-                <div className="flex flex-col gap-3">
-                  <div className="flex items-center gap-2 border-b border-black/5 pb-3 dark:border-white/5">
+                <>
+                  <div className="flex shrink-0 items-center gap-2 border-b border-black/5 p-4 dark:border-white/5">
                     <span
                       className={cn(
                         "inline-flex rounded-full px-2 py-0.5 text-[10px] font-semibold",
@@ -278,11 +355,22 @@ export default function RequestMessageAnalysisModal({ isOpen, onClose, request }
                     <span className="ml-auto font-mono text-[10px] text-text-subtle">
                       {selectedMessage.blocks.length} block(s)
                     </span>
+                    <button
+                      type="button"
+                      onClick={handleOpenFullscreen}
+                      className="flex h-7 w-7 items-center justify-center rounded-md text-text-muted transition-colors hover:bg-black/[0.06] hover:text-text-main dark:hover:bg-white/[0.08]"
+                      title="Open message in full window"
+                      aria-label="Open message in full window"
+                    >
+                      <span className="material-symbols-outlined text-[18px]">open_in_full</span>
+                    </button>
                   </div>
-                  <BlockList blocks={selectedMessage.blocks} />
-                </div>
+                  <div className="min-h-0 flex-1 overflow-y-auto p-4 custom-scrollbar">
+                    <BlockList blocks={selectedMessage.blocks} />
+                  </div>
+                </>
               ) : (
-                <div className="py-8 text-center text-sm text-text-muted">
+                <div className="flex flex-1 items-center justify-center py-8 text-center text-sm text-text-muted">
                   Select a message to inspect its content.
                 </div>
               )}

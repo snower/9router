@@ -572,21 +572,23 @@ export default function RequestDetailsTab() {
                     title="1. Client Request (Input)"
                     defaultOpen={true}
                     icon="input"
-                    action={hasAnalyzableRequestMessages({ request: selectedDetail.request }) ? (
-                      <button
-                        type="button"
-                        onClick={handleOpenAnalysis}
-                        className="flex h-8 w-8 items-center justify-center rounded-md text-text-muted transition-colors hover:bg-black/[0.06] hover:text-text-main dark:hover:bg-white/[0.08]"
-                        title="Analyze request messages"
-                        aria-label="Analyze request messages"
-                      >
-                        <span className="material-symbols-outlined text-[18px]">analytics</span>
-                      </button>
-                    ) : null}
                   >
-                    <pre className="max-h-[300px] max-w-full overflow-auto rounded-lg border border-black/5 bg-black/5 p-3 font-mono text-xs text-text-main dark:border-white/5 dark:bg-white/5 sm:p-4">
-                      {JSON.stringify(selectedDetail.request, null, 2)}
-                    </pre>
+                    <div className="relative">
+                      {hasAnalyzableRequestMessages({ request: selectedDetail.request }) && (
+                        <button
+                          type="button"
+                          onClick={handleOpenAnalysis}
+                          className="absolute right-3 top-3 z-10 flex h-8 w-8 items-center justify-center rounded-md text-text-muted transition-colors hover:bg-black/[0.06] hover:text-text-main dark:hover:bg-white/[0.08]"
+                          title="Analyze request messages"
+                          aria-label="Analyze request messages"
+                        >
+                          <span className="material-symbols-outlined text-[18px]">analytics</span>
+                        </button>
+                      )}
+                      <pre className="max-h-[300px] max-w-full overflow-auto rounded-lg border border-black/5 bg-black/5 p-3 pr-12 font-mono text-xs text-text-main dark:border-white/5 dark:bg-white/5 sm:p-4 sm:pr-12">
+                        {JSON.stringify(selectedDetail.request, null, 2)}
+                      </pre>
+                    </div>
                   </CollapsibleSection>
 
                   {selectedDetail.providerRequest && (
