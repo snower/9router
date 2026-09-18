@@ -96,10 +96,17 @@ export function createStreamController({ onDisconnect, onError, log, provider, m
  * for long periods while raw bytes still flow (e.g. Kiro EventStream
  * binary frames buffering, Claude reasoning streams).
  */
-export function createDisconnectAwareStream(transformStream, streamController, onAbortTerminal = null) {
+export function createDisconnectAwareStream(transformStream, streamController, onAbortTerminal = null, onTerminalOutcome = null) {
   const reader = transformStream.readable.getReader();
   const writer = transformStream.writable.getWriter();
   let terminalEmitted = false;
+
+  // Fire the non-success terminal outcome at most once; the consumer keeps its
+  // own one-shot guard, this only avoids redundant work on repeated paths.
+  const emitTerminalOutcome = (reason) => {
+    if (!onTerminalOutcome) return;
+    try { onTerminalOutcome(reason); } catch { /* terminal outcome is best-effort */ }
+  };
 
   // Emit a synthesized terminal payload (e.g. Responses response.failed + [DONE]) once
   const emitTerminal = (controller) => {
@@ -114,6 +121,7 @@ export function createDisconnectAwareStream(transformStream, streamController, o
   return new ReadableStream({
     async pull(controller) {
       if (!streamController.isConnected()) {
+        emitTerminalOutcome("client_disconnect");
         emitTerminal(controller);
         controller.close();
         return;
@@ -154,6 +162,7 @@ export function createDisconnectAwareStream(transformStream, streamController, o
 
         // Graceful close on network/abort, or when a structured terminal is available
         // (Responses passthrough prefers response.failed + [DONE] over a raw transport error)
+        if (!isControllerClosed) emitTerminalOutcome(isNetworkClose ? "stream_disconnect" : "stream_error");
         try {
           if (!wasConnected || isNetworkClose || onAbortTerminal) {
             emitTerminal(controller);
@@ -166,6 +175,7 @@ export function createDisconnectAwareStream(transformStream, streamController, o
     },
 
     cancel(reason) {
+      emitTerminalOutcome("client_disconnect");
       streamController.handleDisconnect(reason || "cancelled");
       reader.cancel();
       writer.abort();
@@ -189,7 +199,7 @@ export function createDisconnectAwareStream(transformStream, streamController, o
  * @param {TransformStream} transformStream - Transform stream for SSE
  * @param {object} streamController - Stream controller from createStreamController
  */
-export function pipeWithDisconnect(providerResponse, transformStream, streamController, onAbortTerminal = null, stallTimeoutMs = STREAM_STALL_TIMEOUT_MS) {
+export function pipeWithDisconnect(providerResponse, transformStream, streamController, onAbortTerminal = null, stallTimeoutMs = STREAM_STALL_TIMEOUT_MS, onTerminalOutcome = null) {
   let stallTimer = null;
   let chunkCount = 0;
   let totalBytes = 0;
@@ -199,11 +209,16 @@ export function pipeWithDisconnect(providerResponse, transformStream, streamCont
   const clearStall = () => {
     if (stallTimer) { clearTimeout(stallTimer); stallTimer = null; }
   };
+  const emitTerminalOutcome = (reason) => {
+    if (!onTerminalOutcome) return;
+    try { onTerminalOutcome(reason); } catch { /* terminal outcome is best-effort */ }
+  };
   const armStall = () => {
     clearStall();
     stallTimer = setTimeout(() => {
       stallTimer = null;
       dbg(tag, `STALL TIMEOUT ${stallTimeoutMs}ms | chunks=${chunkCount} | bytes=${totalBytes} | sinceLast=${Date.now() - lastChunkAt}ms`);
+      emitTerminalOutcome("stream_stall");
       streamController.handleError?.(new Error("stream stall timeout"));
       streamController.abort?.();
     }, stallTimeoutMs);
@@ -249,7 +264,8 @@ export function pipeWithDisconnect(providerResponse, transformStream, streamCont
   return createDisconnectAwareStream(
     { readable: transformedBody, writable: { getWriter: () => ({ abort: () => Promise.resolve() }) } },
     wrappedController,
-    onAbortTerminal
+    onAbortTerminal,
+    emitTerminalOutcome
   );
 }
 
