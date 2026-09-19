@@ -82,8 +82,8 @@ describe("Timslite request-details configuration", () => {
     expect(TIMSLITE_REQUEST_DETAILS_PATH).toBe(path.join(DB_DIR, "timslite", "9router"));
   });
 
-  it.each([undefined, "", "0", "-3", "1.5", "30days", "not-a-number"])("defaults invalid retention %j to 90 days", (value) => {
-    expect(getTimsliteRetentionDays({ OBSERVABILITY_TIMSLITE_RETENTION_DAYS: value })).toBe(90);
+  it.each([undefined, "", "0", "-3", "1.5", "30days", "not-a-number"])("defaults invalid retention %j to 7 days", (value) => {
+    expect(getTimsliteRetentionDays({ OBSERVABILITY_TIMSLITE_RETENTION_DAYS: value })).toBe(7);
   });
 
   it("uses a positive whole-day retention value", () => {
@@ -161,7 +161,7 @@ describe("Timslite request-details store", () => {
     expect(fake.calls.flush).toBe(0);
   });
 
-  it("opens local 9router/requestDetails with the configured path and configures 90-day retention", async () => {
+  it("opens local 9router/requestDetails with the configured path and configures 7-day retention", async () => {
     const fake = makeFakeAdapter();
     const store = createRequestDetailsStore({
       adapter: fake.adapter,
@@ -176,7 +176,7 @@ describe("Timslite request-details store", () => {
       name: "requestDetails",
       type: "raw",
     });
-    expect(fake.calls.createDataset[0].options.retentionWindow).toBe(90n * 24n * 60n * 60n * 1_000_000n);
+    expect(fake.calls.createDataset[0].options.retentionWindow).toBe(7n * 24n * 60n * 60n * 1_000_000n);
   });
 
   it("uses a custom retention when configured", async () => {
@@ -579,7 +579,7 @@ describe("Explicit writable-store semantics", () => {
     });
     await store.stage({ id: "a" });
     expect(fake.calls.storeOpen).toHaveLength(1);
-    expect(fake.calls.storeOpen[0].config).toEqual({ readOnly: false });
+    expect(fake.calls.storeOpen[0].config).toMatchObject({ readOnly: false });
   });
 
   it("stage rejects if returned store is read-only", async () => {
@@ -777,4 +777,42 @@ describe("Truncation edge cases", () => {
     expect(Buffer.byteLength(result, "utf8")).toBeLessThanOrEqual(200);
     expect(() => JSON.parse(result)).not.toThrow();
   });
+});
+
+describe("Timslite writable store flush interval", () => {
+  it("opens the writable store with flushIntervalMs defaulting to 15000", async () => {
+    const fake = makeFakeAdapter();
+    const store = createRequestDetailsStore({
+      adapter: fake.adapter,
+      env: { OBSERVABILITY_TIMSLITE_DATA_STORE: "true" },
+    });
+    await store.stage({ id: "flush-default" });
+    await store.flush();
+    expect(fake.calls.storeOpen).toHaveLength(1);
+    expect(fake.calls.storeOpen[0].config).toMatchObject({ readOnly: false, flushIntervalMs: 15000 });
+  });
+
+  it("uses a valid seconds override for flushIntervalMs", async () => {
+    const fake = makeFakeAdapter();
+    const store = createRequestDetailsStore({
+      adapter: fake.adapter,
+      env: { OBSERVABILITY_TIMSLITE_DATA_STORE: "true", OBSERVABILITY_TIMSLITE_FLUSH_INTERVAL_SECONDS: "30" },
+    });
+    await store.stage({ id: "flush-override" });
+    await store.flush();
+    expect(fake.calls.storeOpen[0].config).toMatchObject({ readOnly: false, flushIntervalMs: 30000 });
+  });
+
+  it.each([undefined, "", "0", "-1", "1.5", "abc", "30s", "NaN"])(
+    "falls back to the 15000ms default for invalid flush interval %j",
+    async (value) => {
+      const fake = makeFakeAdapter();
+      const env = { OBSERVABILITY_TIMSLITE_DATA_STORE: "true" };
+      if (value !== undefined) env.OBSERVABILITY_TIMSLITE_FLUSH_INTERVAL_SECONDS = value;
+      const store = createRequestDetailsStore({ adapter: fake.adapter, env });
+      await store.stage({ id: "flush-invalid" });
+      await store.flush();
+      expect(fake.calls.storeOpen[0].config).toMatchObject({ readOnly: false, flushIntervalMs: 15000 });
+    }
+  );
 });

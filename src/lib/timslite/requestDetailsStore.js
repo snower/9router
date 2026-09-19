@@ -1,6 +1,7 @@
 import { TIMSLITE_REQUEST_DETAILS_PATH } from "@/lib/db/paths.js";
 
-const DEFAULT_RETENTION_DAYS = 90;
+const DEFAULT_RETENTION_DAYS = 7;
+const DEFAULT_FLUSH_INTERVAL_SECONDS = 15;
 export const TIMSLITE_RECORD_MAX_BYTES = 4 * 1024 * 1024;
 export const TIMSLITE_RECORD_SAFE_BYTES = TIMSLITE_RECORD_MAX_BYTES - 64 * 1024;
 const DATASET_NAME = "requestDetails";
@@ -20,6 +21,26 @@ export function getTimsliteRetentionDays(env = process.env) {
   if (!Number.isSafeInteger(value) || value <= 0) return DEFAULT_RETENTION_DAYS;
 
   return value;
+}
+
+function parsePositiveIntegerSeconds(raw, fallbackSeconds) {
+  if (raw === undefined || raw === null) return fallbackSeconds;
+
+  const trimmed = String(raw).trim();
+  if (!/^[1-9]\d*$/.test(trimmed)) return fallbackSeconds;
+
+  const value = Number(trimmed);
+  if (!Number.isSafeInteger(value) || value <= 0) return fallbackSeconds;
+
+  return value;
+}
+
+export function getTimsliteFlushIntervalMs(env = process.env) {
+  const seconds = parsePositiveIntegerSeconds(
+    env.OBSERVABILITY_TIMSLITE_FLUSH_INTERVAL_SECONDS,
+    DEFAULT_FLUSH_INTERVAL_SECONDS,
+  );
+  return seconds * 1000;
 }
 
 function daysToMicroseconds(days) {
@@ -148,6 +169,7 @@ export function createRequestDetailsStore({ adapter, env = process.env, clock, l
   const idGen = createMonotonicMicrosecondId(clock);
   const retentionDays = getTimsliteRetentionDays(env);
   const retentionWindow = daysToMicroseconds(retentionDays);
+  const flushIntervalMs = getTimsliteFlushIntervalMs(env);
   const log = logger || { warn: () => {} };
 
   let store = null;
@@ -164,7 +186,7 @@ export function createRequestDetailsStore({ adapter, env = process.env, clock, l
 
     initPromise = (async () => {
       const adapterImpl = adapter || await createDefaultAdapter();
-      store = await adapterImpl.openStore(TIMSLITE_REQUEST_DETAILS_PATH, { readOnly: false });
+      store = await adapterImpl.openStore(TIMSLITE_REQUEST_DETAILS_PATH, { readOnly: false, flushIntervalMs });
       if (store.readOnly === true) {
         throw new Error("Timslite store opened in read-only mode; cannot write request details");
       }
