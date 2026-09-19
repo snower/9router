@@ -798,4 +798,143 @@ describe("requestDetailsRepo Timslite integration", () => {
       );
     });
   });
+
+  describe("OBSERVABILITY_DATA_PROVIDER_DROP for provider payloads", () => {
+    it("drops providerRequest/providerResponse from the Timslite record when the literal true is set", async () => {
+      process.env.OBSERVABILITY_TIMSLITE_DATA_STORE = "true";
+      process.env.OBSERVABILITY_DATA_PROVIDER_DROP = "true";
+      fakeTimslite = makeFakeTimsliteAdapter();
+
+      if (repoTest.setStoreFactory) {
+        repoTest.setStoreFactory(() => {
+          store = createRequestDetailsStore({
+            adapter: fakeTimslite.adapter,
+            env: { OBSERVABILITY_TIMSLITE_DATA_STORE: "true" },
+          });
+          return store;
+        });
+      }
+
+      await saveRequestDetail({
+        id: "drop-timslite",
+        provider: "openai",
+        request: { body: "keep" },
+        providerRequest: { body: "drop-me" },
+        providerResponse: { body: "drop-me-too" },
+        response: { body: "keep-response" },
+      });
+      await repoTest.flushNow();
+
+      expect(fakeTimslite.calls.write.length).toBe(1);
+      const written = JSON.parse(fakeTimslite.calls.write[0].data.toString("utf8"));
+      expect(written.request).toEqual({ body: "keep" });
+      expect(written.response).toEqual({ body: "keep-response" });
+      expect(written.providerRequest).toBeUndefined();
+      expect(written.providerResponse).toBeUndefined();
+    });
+
+    it("drops providerRequest/providerResponse from the inline SQLite fallback when Timslite is disabled", async () => {
+      delete process.env.OBSERVABILITY_TIMSLITE_DATA_STORE;
+      process.env.OBSERVABILITY_DATA_PROVIDER_DROP = "true";
+
+      const detail = {
+        id: "drop-sqlite",
+        provider: "openai",
+        request: { body: "keep" },
+        providerRequest: { body: "drop-me" },
+        providerResponse: { body: "drop-me-too" },
+        response: { body: "keep-response" },
+      };
+
+      await saveRequestDetail(detail);
+      await repoTest.flushNow();
+
+      const insertCall = mockDbAdapter.run.mock.calls.find((call) =>
+        call[0].includes("INSERT INTO requestDetails")
+      );
+      expect(insertCall).toBeDefined();
+      const parsed = JSON.parse(insertCall[1][insertCall[1].length - 1]);
+      expect(parsed.request).toEqual({ body: "keep" });
+      expect(parsed.response).toEqual({ body: "keep-response" });
+      expect(parsed.providerRequest).toBeUndefined();
+      expect(parsed.providerResponse).toBeUndefined();
+    });
+
+    it("drops provider payloads in the inline fallback after a Timslite stage failure", async () => {
+      process.env.OBSERVABILITY_TIMSLITE_DATA_STORE = "true";
+      process.env.OBSERVABILITY_DATA_PROVIDER_DROP = "true";
+      fakeTimslite = makeFakeTimsliteAdapter({ forceError: "write" });
+
+      if (repoTest.setStoreFactory) {
+        repoTest.setStoreFactory(() => {
+          store = createRequestDetailsStore({
+            adapter: fakeTimslite.adapter,
+            env: { OBSERVABILITY_TIMSLITE_DATA_STORE: "true" },
+          });
+          return store;
+        });
+      }
+
+      await saveRequestDetail({
+        id: "drop-fallback",
+        provider: "openai",
+        request: { body: "keep" },
+        providerRequest: { body: "drop-me" },
+        providerResponse: { body: "drop-me-too" },
+      });
+      await repoTest.flushNow();
+
+      const insertCall = mockDbAdapter.run.mock.calls.find((call) =>
+        call[0].includes("INSERT INTO requestDetails")
+      );
+      expect(insertCall).toBeDefined();
+      const parsed = JSON.parse(insertCall[1][insertCall[1].length - 1]);
+      expect(parsed.timslite_id).toBeUndefined();
+      expect(parsed.providerRequest).toBeUndefined();
+      expect(parsed.providerResponse).toBeUndefined();
+    });
+
+    it.each(["TRUE", "True", "tRuE", " true", "true ", " true ", "1", "0", "yes", "false", ""])(
+      "keeps provider payloads in the SQLite fallback when the drop value is %j",
+      async (value) => {
+        delete process.env.OBSERVABILITY_TIMSLITE_DATA_STORE;
+        process.env.OBSERVABILITY_DATA_PROVIDER_DROP = value;
+
+        await saveRequestDetail({
+          id: `keep-${value.trim() || "empty"}`,
+          provider: "openai",
+          providerRequest: { body: "keep-me" },
+          providerResponse: { body: "keep-me-too" },
+        });
+        await repoTest.flushNow();
+
+        const insertCall = mockDbAdapter.run.mock.calls.find((call) =>
+          call[0].includes("INSERT INTO requestDetails")
+        );
+        expect(insertCall).toBeDefined();
+        const parsed = JSON.parse(insertCall[1][insertCall[1].length - 1]);
+        expect(parsed.providerRequest).toEqual({ body: "keep-me" });
+        expect(parsed.providerResponse).toEqual({ body: "keep-me-too" });
+      }
+    );
+
+    it("does not mutate the caller's detail object when provider payloads are dropped", async () => {
+      delete process.env.OBSERVABILITY_TIMSLITE_DATA_STORE;
+      process.env.OBSERVABILITY_DATA_PROVIDER_DROP = "true";
+
+      const detail = {
+        id: "drop-no-mutate",
+        provider: "openai",
+        request: { body: "keep" },
+        providerRequest: { body: "drop-me" },
+        providerResponse: { body: "drop-me-too" },
+      };
+      const snapshot = JSON.parse(JSON.stringify(detail));
+
+      await saveRequestDetail(detail);
+      await repoTest.flushNow();
+
+      expect(detail).toEqual(snapshot);
+    });
+  });
 });

@@ -3,8 +3,9 @@ import { needsTranslation } from "../../translator/index.js";
 import { createSSETransformStreamWithLogger, createPassthroughStreamWithLogger } from "../../utils/stream.js";
 import { pipeWithDisconnect } from "../../utils/streamHandler.js";
 import { PROVIDERS } from "../../config/providers.js";
-import { STREAM_STALL_TIMEOUT_MS } from "../../config/runtimeConfig.js";
+import { HTTP_STATUS, STREAM_STALL_TIMEOUT_MS } from "../../config/runtimeConfig.js";
 import { buildAbortedResponsesTerminalBytes } from "../../utils/responsesStreamHelpers.js";
+import { buildStreamErrorBytes } from "../../utils/streamHelpers.js";
 import { buildRequestDetail, extractRequestConfig, saveUsageStats, formatDoneLine } from "./requestDetail.js";
 import { saveRequestDetail } from "@/lib/usageDb.js";
 import { SSE_HEADERS_CORS as SSE_HEADERS } from "../../utils/sseConstants.js";
@@ -37,13 +38,13 @@ function buildTransformStream({ provider, sourceFormat, targetFormat, userAgent,
     return createSSETransformStreamWithLogger(targetFormat, sourceFormat, provider, reqLogger, toolNameMap, model, connectionId, body, onStreamComplete, apiKey, customToolNames, credentials);
   }
 
-  return createPassthroughStreamWithLogger(provider, reqLogger, model, connectionId, body, onStreamComplete, apiKey);
+  return createPassthroughStreamWithLogger(provider, reqLogger, model, connectionId, body, onStreamComplete, apiKey, targetFormat, sourceFormat);
 }
 
 /**
  * Handle streaming response — pipe provider SSE through transform stream to client.
  */
-export async function handleStreamingResponse({ providerResponse, provider, model, sourceFormat, targetFormat, userAgent, body, stream, translatedBody, finalBody, requestStartTime, connectionId, apiKey, clientRawRequest, onRequestSuccess, reqLogger, toolNameMap, customToolNames, streamController, onStreamComplete, streamDetailId, pxpipe, reqTag, log, credentials }) {
+export async function handleStreamingResponse({ providerResponse, provider, model, sourceFormat, targetFormat, userAgent, body, reqLogger, toolNameMap, customToolNames, connectionId, apiKey, onRequestSuccess, streamController, onStreamComplete, credentials, reqTag, log }) {
   if (onRequestSuccess) {
     Promise.resolve()
       .then(onRequestSuccess)
@@ -51,6 +52,10 @@ export async function handleStreamingResponse({ providerResponse, provider, mode
         console.error("[ChatCore] onRequestSuccess failed:", err?.message || err);
       });
   }
+
+  // Resolved before the non-SSE early return below so that path also reaches the
+  // shared one-shot terminal guard instead of returning with zero writes.
+  const onTerminalOutcome = typeof onStreamComplete?.onTerminalOutcome === "function" ? onStreamComplete.onTerminalOutcome : null;
 
   // When upstream returns HTML/text instead of SSE (e.g. Cloudflare 5xx error
   // page), piping it through the SSE transform stream causes Next.js
@@ -70,6 +75,19 @@ export async function handleStreamingResponse({ providerResponse, provider, mode
     if (log?.errorLine) log.errorLine(reqTag, "✗", `BLOCKED ${status} · ${provider}/${model} · non-SSE (${upstreamContentType})\n    ${shortMsg}`);
     else console.warn(`[STREAM] ${provider} | ${model} | blocked pipe: ${shortMsg} [${status}]`);
     streamController?.handleError?.(new Error(`upstream non-SSE: ${status}`));
+    // Persist the single terminal error detail through the same one-shot
+    // finalizer used by the success path. The upstream body was never piped
+    // through a transform stream, so there is no accumulator snapshot; the
+    // sanitized message is the only safe reason conveyed.
+    if (onTerminalOutcome) {
+      onTerminalOutcome({
+        reason: shortMsg,
+        content: null,
+        thinking: null,
+        usage: null,
+        ttftAt: null
+      });
+    }
     return {
       success: false,
       response: new Response(JSON.stringify({ error: { message: `[${status}]: ${shortMsg}` } }), {
@@ -81,25 +99,38 @@ export async function handleStreamingResponse({ providerResponse, provider, mode
 
   const transformStream = buildTransformStream({ provider, sourceFormat, targetFormat, userAgent, reqLogger, toolNameMap, customToolNames, model, connectionId, body, onStreamComplete, apiKey, credentials });
 
-  // Responses passthrough: synthesize response.failed + [DONE] if the stream aborts/stalls before a terminal event
+  // Terminal bytes when the stream aborts after HTTP 200 was already sent, so the
+  // client sees a real error instead of a silently truncated stream.
+  // Responses passthrough keeps its own response.failed shape; every other client
+  // format gets the OpenAI error frame + [DONE], or `event: error` for Claude.
   const isResponsesPassthrough = sourceFormat === FORMATS.OPENAI_RESPONSES && targetFormat === FORMATS.OPENAI_RESPONSES;
-  const onAbortTerminal = isResponsesPassthrough ? buildAbortedResponsesTerminalBytes : null;
+  const onAbortTerminal = isResponsesPassthrough
+    ? buildAbortedResponsesTerminalBytes
+    : (message) => buildStreamErrorBytes(HTTP_STATUS.GATEWAY_TIMEOUT, message, sourceFormat);
   const stallTimeoutMs = PROVIDERS[provider]?.stallTimeoutMs || STREAM_STALL_TIMEOUT_MS;
-  const transformedBody = pipeWithDisconnect(providerResponse, transformStream, streamController, onAbortTerminal, stallTimeoutMs);
 
-  saveRequestDetail(buildRequestDetail({
-    provider, model, connectionId,
-    latency: { ttft: 0, total: Date.now() - requestStartTime },
-    tokens: { prompt_tokens: 0, completion_tokens: 0 },
-    request: extractRequestConfig(body, stream),
-    providerRequest: finalBody || translatedBody || null,
-    providerResponse: "[Streaming - raw response not captured]",
-    response: { content: "[Streaming in progress...]", thinking: null, type: "streaming" },
-    pxpipe,
-    status: "success"
-  }, { id: streamDetailId })).catch(err => {
-    console.error("[RequestDetail] Failed to save streaming request:", err.message);
-  });
+  // Terminal RequestDetail is persisted exactly once, at the first terminal
+  // outcome: success through onStreamComplete (the transform stream finalizer),
+  // or the non-success terminal writer this pipeline invokes for disconnect,
+  // stall, read/network error and transform error. The snapshot is read from the
+  // transform stream so partial content is preserved on abnormal termination.
+  const snapshotTerminal = (reason) => {
+    if (!onTerminalOutcome) return;
+    let snap = null;
+    try { snap = typeof transformStream.snapshot === "function" ? transformStream.snapshot() : null; } catch { snap = null; }
+    // Success already claimed the terminal and is only waiting for delivery: the
+    // late disconnect/error must not overwrite that outcome with a non-success one.
+    if (snap?.terminalEstablished) return;
+    onTerminalOutcome({
+      reason,
+      content: snap?.content,
+      thinking: snap?.thinking,
+      usage: snap?.usage,
+      ttftAt: snap?.ttftAt
+    });
+  };
+
+  const transformedBody = pipeWithDisconnect(providerResponse, transformStream, streamController, onAbortTerminal, stallTimeoutMs, snapshotTerminal);
 
   return {
     success: true,
@@ -113,13 +144,26 @@ export async function handleStreamingResponse({ providerResponse, provider, mode
 export function buildOnStreamComplete({ provider, model, connectionId, apiKey, requestStartTime, body, stream, finalBody, translatedBody, clientRawRequest, pxpipe, reqTag, log }) {
   const streamDetailId = `${Date.now()}-${Math.random().toString(36).slice(2, 11)}`;
 
-  const onStreamComplete = (contentObj, usage, ttftAt) => {
+  // Exactly one terminal RequestDetail is persisted per stream, whichever
+  // outcome lands first. The guard is shared by the success writer
+  // (onStreamComplete) and the non-success terminal writer (onTerminalOutcome),
+  // so a disconnect/stall/error can never be followed by a success write and a
+  // completed stream can never be overwritten by a later terminal outcome.
+  let terminalPersisted = false;
+
+  const finalizeTerminal = ({ status = "success", content, thinking, usage, ttftAt, reason } = {}) => {
+    if (terminalPersisted) return false;
+    terminalPersisted = true;
+
+    const isError = status !== "success";
     const latency = {
       ttft: ttftAt ? ttftAt - requestStartTime : Date.now() - requestStartTime,
       total: Date.now() - requestStartTime
     };
-    const safeContent = contentObj?.content || "[Empty streaming response]";
-    const safeThinking = contentObj?.thinking || null;
+    const safeContent = content || (isError ? "[Stream interrupted]" : "[Empty streaming response]");
+    const safeThinking = thinking || null;
+    const response = { content: safeContent, thinking: safeThinking, type: "streaming" };
+    if (isError) response.error = String(reason || "stream_error").replace(/\s+/g, " ").slice(0, 160);
 
     saveRequestDetail(buildRequestDetail({
       provider, model, connectionId,
@@ -128,17 +172,41 @@ export function buildOnStreamComplete({ provider, model, connectionId, apiKey, r
       request: extractRequestConfig(body, stream),
       providerRequest: finalBody || translatedBody || null,
       providerResponse: safeContent,
-      response: { content: safeContent, thinking: safeThinking, type: "streaming" },
+      response,
       pxpipe,
-      status: "success"
-    }, { id: streamDetailId })).catch(err => {
-      console.error("[RequestDetail] Failed to update streaming content:", err.message);
+      status: isError ? "error" : "success"
+    }), { id: streamDetailId }).catch(err => {
+      console.error("[RequestDetail] Failed to save streaming request:", err.message);
     });
+
+    return true;
+  };
+
+  const onStreamComplete = (contentObj, usage, ttftAt) => {
+    const persisted = finalizeTerminal({
+      status: "success",
+      content: contentObj?.content,
+      thinking: contentObj?.thinking,
+      usage,
+      ttftAt
+    });
+    if (!persisted) return;
+
+    const latency = {
+      ttft: ttftAt ? ttftAt - requestStartTime : Date.now() - requestStartTime,
+      total: Date.now() - requestStartTime
+    };
 
     // Persist stream usage to DB (no console line; the "📊 done" line below is authoritative)
     saveUsageStats({ provider, model, tokens: usage, connectionId, apiKey, endpoint: clientRawRequest?.endpoint, label: "STREAM USAGE", silent: true });
     if (log?.line) log.line(reqTag, "📊", formatDoneLine({ usage, latency }));
   };
+
+  // Non-success terminal writer, consumed by the streaming pipeline for
+  // disconnect/stall/read-error/transform-error outcomes. Carried on the
+  // onStreamComplete function object so the single callback the pipeline
+  // already receives is enough to reach the shared one-shot guard.
+  onStreamComplete.onTerminalOutcome = (outcome) => finalizeTerminal({ status: "error", ...outcome });
 
   return { onStreamComplete, streamDetailId };
 }

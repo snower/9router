@@ -136,6 +136,7 @@ async function drainWriteBuffer() {
       const db = await getAdapter();
       const config = await getObservabilityConfig();
 
+      const dropProviderPayloads = process.env.OBSERVABILITY_DATA_PROVIDER_DROP === "true";
       const timsliteEnabled = isTimsliteDataStoreEnabled(process.env);
       let useTimslite = false;
       const stagedItems = [];
@@ -166,6 +167,11 @@ async function drainWriteBuffer() {
                 response: item.response || {},
                 pxpipe: item.pxpipe || undefined,
               };
+
+              if (dropProviderPayloads) {
+                delete fullRecord.providerRequest;
+                delete fullRecord.providerResponse;
+              }
 
               try {
                 const pointer = await timsliteStore.stage(fullRecord);
@@ -246,6 +252,11 @@ async function drainWriteBuffer() {
               response: truncateField(item.response, config.maxJsonSize),
               pxpipe: item.pxpipe || undefined,
             };
+
+            if (dropProviderPayloads) {
+              delete record.providerRequest;
+              delete record.providerResponse;
+            }
 
             db.run(
               `INSERT INTO requestDetails(id, timestamp, provider, model, connectionId, status, data) VALUES(?, ?, ?, ?, ?, ?, ?) ON CONFLICT(id) DO UPDATE SET timestamp = excluded.timestamp, provider = excluded.provider, model = excluded.model, connectionId = excluded.connectionId, status = excluded.status, data = excluded.data`,
