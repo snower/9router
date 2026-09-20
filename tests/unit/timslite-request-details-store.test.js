@@ -1,4 +1,3 @@
-import { createHash } from "node:crypto";
 import path from "node:path";
 import { beforeEach, describe, expect, it } from "vitest";
 import { DB_DIR, TIMSLITE_REQUEST_DETAILS_PATH } from "@/lib/db/paths.js";
@@ -16,10 +15,6 @@ import {
   isTimsliteDataStoreEnabled,
   truncateUtf8Json,
 } from "@/lib/timslite/requestDetailsStore.js";
-
-function sha256Hex(value) {
-  return createHash("sha256").update(JSON.stringify(value), "utf8").digest("hex");
-}
 
 function makeFakeAdapter(options = {}) {
   const records = new Map();
@@ -831,7 +826,7 @@ describe("Message deduplication — refs and local reuse", () => {
   beforeEach(() => _resetGlobalValueCache());
   const sharedMessage = { role: "user", content: "hello" };
 
-  it("replaces request.messages items with strict SHA-256 refs backed by __values__ object map", async () => {
+  it("replaces request.messages items with strict index refs backed by an ordered __values__ array", async () => {
     const fake = makeFakeAdapter();
     const store = createRequestDetailsStore({
       adapter: fake.adapter,
@@ -841,13 +836,13 @@ describe("Message deduplication — refs and local reuse", () => {
     await store.flush();
 
     const written = JSON.parse(fake.records.get(fake.calls.write[0].timestamp.toString()));
-    const sha = sha256Hex(sharedMessage);
-    expect(written.request.messages).toEqual([`#/0/${sha}`]);
+    expect(written.request.messages).toEqual(["#/0/0"]);
     expect(written.request.messages[0]).toMatch(TIMSLITE_VALUE_REF_PATTERN);
-    expect(written.__values__).toEqual({ [sha]: sharedMessage });
+    expect(Array.isArray(written.__values__)).toBe(true);
+    expect(written.__values__).toEqual([sharedMessage]);
   });
 
-  it("reuses one __values__ entry for duplicate messages within a record (local ref)", async () => {
+  it("reuses one __values__ index for duplicate messages within a record (local ref)", async () => {
     const fake = makeFakeAdapter();
     const store = createRequestDetailsStore({
       adapter: fake.adapter,
@@ -856,10 +851,28 @@ describe("Message deduplication — refs and local reuse", () => {
     await store.stage({ id: "a", request: { messages: [sharedMessage, structuredClone(sharedMessage)] } });
     await store.flush();
 
-    const sha = sha256Hex(sharedMessage);
     const written = JSON.parse(fake.records.get(fake.calls.write[0].timestamp.toString()));
-    expect(written.request.messages).toEqual([`#/0/${sha}`, `#/0/${sha}`]);
-    expect(written.__values__).toEqual({ [sha]: sharedMessage });
+    expect(written.request.messages).toEqual(["#/0/0", "#/0/0"]);
+    expect(written.__values__).toEqual([sharedMessage]);
+  });
+
+  it("establishes array index order from first new values encountered", async () => {
+    const fake = makeFakeAdapter();
+    const store = createRequestDetailsStore({
+      adapter: fake.adapter,
+      env: { OBSERVABILITY_TIMSLITE_DATA_STORE: "true" },
+    });
+    const first = { role: "user", content: "first" };
+    const second = { role: "assistant", content: "second" };
+    await store.stage({
+      id: "a",
+      request: { messages: [first, second, structuredClone(first)] },
+    });
+    await store.flush();
+
+    const written = JSON.parse(fake.records.get(fake.calls.write[0].timestamp.toString()));
+    expect(written.request.messages).toEqual(["#/0/0", "#/0/1", "#/0/0"]);
+    expect(written.__values__).toEqual([first, second]);
   });
 
   it("deduplicates request and providerRequest messages independently", async () => {
@@ -876,13 +889,12 @@ describe("Message deduplication — refs and local reuse", () => {
     });
     await store.flush();
 
-    const shaShared = sha256Hex(sharedMessage);
-    const shaProvider = sha256Hex(providerMessage);
     const written = JSON.parse(fake.records.get(fake.calls.write[0].timestamp.toString()));
-    expect(written.request.messages).toEqual([`#/0/${shaShared}`]);
-    expect(written.providerRequest.messages[0]).toBe(`#/0/${shaProvider}`);
-    expect(written.providerRequest.messages[1]).toBe(`#/0/${shaShared}`);
-    expect(written.__values__).toEqual({ [shaShared]: sharedMessage, [shaProvider]: providerMessage });
+    expect(written.request.messages).toEqual(["#/0/0"]);
+    expect(written.providerRequest.messages[0]).toBe("#/0/1");
+    expect(written.providerRequest.messages[1]).toBe("#/0/0");
+    // sharedMessage established index 0 first (request), providerMessage index 1.
+    expect(written.__values__).toEqual([sharedMessage, providerMessage]);
   });
 
   it("leaves non-message request fields untouched", async () => {
@@ -914,14 +926,12 @@ describe("Message deduplication — cross-record reuse", () => {
     await store.stage({ id: "b", request: { messages: [structuredClone(sharedMessage)] } });
     await store.flush();
 
-    const sha = sha256Hex(sharedMessage);
     const firstId = fake.calls.write[0].timestamp.toString();
     const first = JSON.parse(fake.records.get(firstId));
     const second = JSON.parse(fake.records.get(fake.calls.write[1].timestamp.toString()));
-    expect(first.request.messages).toEqual([`#/0/${sha}`]);
-    expect(first.__values__).toEqual({ [sha]: sharedMessage });
-    // Second record references the first via cross-record ref
-    expect(second.request.messages).toEqual([`#/${firstId}/${sha}`]);
+    expect(first.request.messages).toEqual(["#/0/0"]);
+    expect(first.__values__).toEqual([sharedMessage]);
+    expect(second.request.messages).toEqual([`#/${firstId}/0`]);
     expect(second.__values__).toBeUndefined();
   });
 
@@ -938,10 +948,9 @@ describe("Message deduplication — cross-record reuse", () => {
     await store.stage({ id: "b", request: { messages: [structuredClone(sharedMessage)] } });
     await store.flush();
 
-    const sha = sha256Hex(sharedMessage);
     expect(fake.calls.write).toHaveLength(2);
     const second = JSON.parse(fake.records.get(fake.calls.write[1].timestamp.toString()));
-    expect(second.request.messages).toEqual([`#/${firstId}/${sha}`]);
+    expect(second.request.messages).toEqual([`#/${firstId}/0`]);
     expect(second.__values__).toBeUndefined();
   });
 
@@ -977,15 +986,13 @@ describe("Message deduplication — cross-record reuse", () => {
     await store.flush();
     const idB = fake.calls.write[1].timestamp.toString();
 
-    // Verify record B has cross-record refs for msg1/msg2 and local ref for msg3
-    const sha1 = sha256Hex(msg1);
-    const sha2 = sha256Hex(msg2);
-    const sha3 = sha256Hex(msg3);
+    // Record A stored msg1 at index 0 and msg2 at index 1, so cross-record
+    // refs into A carry those indices; msg3 is novel and lands locally at 0.
     const writtenB = JSON.parse(fake.records.get(idB));
-    expect(writtenB.request.messages[0]).toBe(`#/${idA}/${sha1}`);
-    expect(writtenB.request.messages[1]).toBe(`#/${idA}/${sha2}`);
-    expect(writtenB.request.messages[2]).toBe(`#/0/${sha3}`);
-    expect(writtenB.__values__).toEqual({ [sha3]: msg3 });
+    expect(writtenB.request.messages[0]).toBe(`#/${idA}/0`);
+    expect(writtenB.request.messages[1]).toBe(`#/${idA}/1`);
+    expect(writtenB.request.messages[2]).toBe("#/0/0");
+    expect(writtenB.__values__).toEqual([msg3]);
 
     // getMany must fully restore all three messages in record B
     const result = await store.getMany([idB]);
@@ -1046,24 +1053,27 @@ describe("Message deduplication — transparent read resolution", () => {
     expect(result.get(pointer.timslite_id)).toEqual({ id: "plain", request: { body: "no messages" } });
   });
 
-  it("leaves a ref with an unknown SHA unresolved and strips __values__ (fail open)", async () => {
+  it("leaves a ref with an out-of-range index unresolved and keeps the unconsumed protocol array", async () => {
     const fake = makeFakeAdapter();
-    const badSha = "0".repeat(64);
-    const record = { id: "corrupt", request: { messages: [`#/0/${badSha}`] }, __values__: {} };
+    const record = { id: "corrupt", request: { messages: ["#/0/99"] }, __values__: [] };
     fake.records.set("123456", JSON.stringify(record));
     const store = createRequestDetailsStore({ adapter: fake.adapter, env: {} });
 
     const result = await store.getMany(["123456"]);
-    expect(result.get("123456").request.messages).toEqual([`#/0/${badSha}`]);
-    expect(result.get("123456").__values__).toBeUndefined();
+    expect(result.get("123456").request.messages).toEqual(["#/0/99"]);
+    expect(result.get("123456").__values__).toEqual([]);
   });
 
   it("rejects non-strict ref forms", () => {
-    expect(TIMSLITE_VALUE_REF_PATTERN.test(`#/0/${"a".repeat(64)}`)).toBe(true);
-    expect(TIMSLITE_VALUE_REF_PATTERN.test(`#/00/${"a".repeat(64)}`)).toBe(false);
-    expect(TIMSLITE_VALUE_REF_PATTERN.test(`#/1/${"A".repeat(64)}`)).toBe(false);
-    expect(TIMSLITE_VALUE_REF_PATTERN.test("#/1/short")).toBe(false);
-    expect(TIMSLITE_VALUE_REF_PATTERN.test(`x#/1/${"a".repeat(64)}`)).toBe(false);
+    expect(TIMSLITE_VALUE_REF_PATTERN.test("#/0/0")).toBe(true);
+    expect(TIMSLITE_VALUE_REF_PATTERN.test("#/12/345")).toBe(true);
+    expect(TIMSLITE_VALUE_REF_PATTERN.test("#/00/0")).toBe(false);
+    expect(TIMSLITE_VALUE_REF_PATTERN.test("#/0/00")).toBe(false);
+    expect(TIMSLITE_VALUE_REF_PATTERN.test("#/0/-1")).toBe(false);
+    expect(TIMSLITE_VALUE_REF_PATTERN.test("#/0/1.5")).toBe(false);
+    expect(TIMSLITE_VALUE_REF_PATTERN.test(`#/0/${"a".repeat(64)}`)).toBe(false);
+    expect(TIMSLITE_VALUE_REF_PATTERN.test("ordinary string")).toBe(false);
+    expect(TIMSLITE_VALUE_REF_PATTERN.test("x#/1/2")).toBe(false);
   });
 });
 
@@ -1083,42 +1093,42 @@ describe("Cross-record cache — TTL and LRU bounds", () => {
     let nowMs = 1_000_000;
     const cache = createValueCache({ ttlMicroseconds: 48n * HOUR_US, clock: () => nowMs });
     const sha = "a".repeat(64);
-    cache.setTimsliteId(sha, "100000");
-    expect(cache.getTimsliteId(sha)).toBe("100000");
+    cache.setRef(sha, "#/100000/0");
+    expect(cache.getRef(sha)).toBe("#/100000/0");
 
     nowMs += Number(47n * HOUR_US / 1000n);
-    expect(cache.getTimsliteId(sha)).toBe("100000");
+    expect(cache.getRef(sha)).toBe("#/100000/0");
 
     nowMs += Number(2n * HOUR_US / 1000n);
-    expect(cache.getTimsliteId(sha)).toBeUndefined();
+    expect(cache.getRef(sha)).toBeUndefined();
   });
 
   it("is disabled for a non-positive TTL", () => {
     const cache = createValueCache({ ttlMicroseconds: 0n });
-    cache.setTimsliteId("a".repeat(64), "100000");
-    expect(cache.getTimsliteId("a".repeat(64))).toBeUndefined();
+    cache.setRef("a".repeat(64), "#/100000/0");
+    expect(cache.getRef("a".repeat(64))).toBeUndefined();
     expect(cache.size).toBe(0);
   });
 
   it("evicts the least recently used entry past the 2048 bound", () => {
     const cache = createValueCache({ maxEntries: 2, ttlMicroseconds: 48n * HOUR_US });
-    cache.setTimsliteId("a".repeat(64), "1");
-    cache.setTimsliteId("b".repeat(64), "2");
-    expect(cache.getTimsliteId("a".repeat(64))).toBe("1");
-    cache.setTimsliteId("c".repeat(64), "3");
+    cache.setRef("a".repeat(64), "#/1/0");
+    cache.setRef("b".repeat(64), "#/2/0");
+    expect(cache.getRef("a".repeat(64))).toBe("#/1/0");
+    cache.setRef("c".repeat(64), "#/3/0");
 
     expect(cache.size).toBe(2);
-    expect(cache.getTimsliteId("b".repeat(64))).toBeUndefined();
-    expect(cache.getTimsliteId("a".repeat(64))).toBe("1");
-    expect(cache.getTimsliteId("c".repeat(64))).toBe("3");
+    expect(cache.getRef("b".repeat(64))).toBeUndefined();
+    expect(cache.getRef("a".repeat(64))).toBe("#/1/0");
+    expect(cache.getRef("c".repeat(64))).toBe("#/3/0");
   });
 
   it("defaults the cache bound to 2048 entries", () => {
     expect(TIMSLITE_VALUE_CACHE_MAX_ENTRIES).toBe(2048);
     const cache = createValueCache({ ttlMicroseconds: 48n * HOUR_US });
-    for (let i = 0; i < 2048; i += 1) cache.setTimsliteId(i.toString(16).padStart(64, "0"), i.toString());
+    for (let i = 0; i < 2048; i += 1) cache.setRef(i.toString(16).padStart(64, "0"), `#/${i}/0`);
     expect(cache.size).toBe(2048);
-    cache.setTimsliteId("f".repeat(64), "99");
+    cache.setRef("f".repeat(64), "#/99/0");
     expect(cache.size).toBe(2048);
   });
 });
@@ -1132,12 +1142,12 @@ describe("Global value cache — cross-instance reuse", () => {
     const nowMs = 1_000_000;
 
     const cache1 = createValueCache({ ttlMicroseconds: 48n * HOUR_US, clock: () => nowMs });
-    cache1.setTimsliteId(sha, "100", BigInt(nowMs) * 1000n);
+    cache1.setRef(sha, "#/100/0", BigInt(nowMs) * 1000n);
 
     // Simulate a new store instance opening later
     const laterMs = nowMs + 1000;
     const cache2 = createValueCache({ ttlMicroseconds: 48n * HOUR_US, clock: () => laterMs });
-    expect(cache2.getTimsliteId(sha)).toBe("100");
+    expect(cache2.getRef(sha)).toBe("#/100/0");
 
     _resetGlobalValueCache();
   });
@@ -1149,12 +1159,12 @@ describe("Global value cache — cross-instance reuse", () => {
 
     // First instance writes with 48h TTL
     const cache1 = createValueCache({ ttlMicroseconds: 48n * HOUR_US, clock: () => nowMs });
-    cache1.setTimsliteId(sha, "200", BigInt(nowMs) * 1000n);
+    cache1.setRef(sha, "#/200/0", BigInt(nowMs) * 1000n);
 
     // Second instance has only 1h TTL; entry written 2h ago is expired
     const twoHoursLaterMs = nowMs + Number(2n * HOUR_US / 1000n);
     const cache2 = createValueCache({ ttlMicroseconds: 1n * HOUR_US, clock: () => twoHoursLaterMs });
-    expect(cache2.getTimsliteId(sha)).toBeUndefined();
+    expect(cache2.getRef(sha)).toBeUndefined();
 
     _resetGlobalValueCache();
   });
@@ -1163,7 +1173,6 @@ describe("Global value cache — cross-instance reuse", () => {
     _resetGlobalValueCache();
     const fake = makeFakeAdapter();
     const sharedMessage = { role: "user", content: "cross-instance" };
-    const sha = sha256Hex(sharedMessage);
 
     // First store writes record A with the message
     const store1 = createRequestDetailsStore({
@@ -1184,7 +1193,7 @@ describe("Global value cache — cross-instance reuse", () => {
 
     // Record B should have a cross-record ref to A, not a local entry
     const writtenB = JSON.parse(fake.records.get(fake.calls.write[1].timestamp.toString()));
-    expect(writtenB.request.messages).toEqual([`#/${idA}/${sha}`]);
+    expect(writtenB.request.messages).toEqual([`#/${idA}/0`]);
     expect(writtenB.__values__).toBeUndefined();
 
     // getMany must still fully restore the message
@@ -1275,15 +1284,12 @@ describe("Deduplication protocol — generalized to tools arrays", () => {
     await store.flush();
 
     const written = JSON.parse(fake.records.get(fake.calls.write[0].timestamp.toString()));
-    const shaMessage = sha256Hex(userMessage);
-    const shaTools = sha256Hex([sharedTool]);
 
-    expect(written.request.messages).toEqual([`#/0/${shaMessage}`]);
-    expect(written.request.tools).toBe(`#/0/${shaTools}`);
-    expect(written.providerRequest.messages).toEqual([`#/0/${shaMessage}`]);
-    expect(written.providerRequest.tools).toBe(`#/0/${shaTools}`);
-    expect(written.__values__[shaMessage]).toEqual(userMessage);
-    expect(written.__values__[shaTools]).toEqual([sharedTool]);
+    expect(written.request.messages).toEqual(["#/0/0"]);
+    expect(written.request.tools).toBe("#/0/1");
+    expect(written.providerRequest.messages).toEqual(["#/0/0"]);
+    expect(written.providerRequest.tools).toBe("#/0/1");
+    expect(written.__values__).toEqual([userMessage, [sharedTool]]);
   });
 
   it("restores a locally deduplicated tools item and message on read with no refs leaked", async () => {
@@ -1337,9 +1343,9 @@ describe("Deduplication protocol — generalized to tools arrays", () => {
     const pointerB = await store.stage({ id: "b", request: { messages: [structuredClone(userMessage)], tools: [structuredClone(sharedTool)] } });
     await store.flush();
 
-    const shaTools = sha256Hex([sharedTool]);
+    // Record A stored userMessage at index 0 and the tools array at index 1.
     const writtenB = JSON.parse(fake.records.get(fake.calls.write[1].timestamp.toString()));
-    expect(writtenB.request.tools).toBe(`#/${idA}/${shaTools}`);
+    expect(writtenB.request.tools).toBe(`#/${idA}/1`);
 
     const result = await store.getMany([pointerB.timslite_id]);
     const detail = result.get(pointerB.timslite_id);
@@ -1371,7 +1377,7 @@ describe("Deduplication protocol — generalized to tools arrays", () => {
 
     const written = JSON.parse(fake.records.get(fake.calls.write[0].timestamp.toString()));
     expect(written.request.tools).toBe("not-an-array");
-    expect(written.request.messages).toEqual([`#/0/${sha256Hex(userMessage)}`]);
+    expect(written.request.messages).toEqual(["#/0/0"]);
   });
 });
 
@@ -1400,22 +1406,22 @@ describe("Deduplication protocol — __values__ collision hardening", () => {
     expect(detail.__values__).toEqual({ user: "pre-existing" });
   });
 
-  it("resolves local refs against the protocol value map even when the payload shadows __values__", async () => {
+  it("resolves local refs against the protocol value array even when the payload shadows __values__", async () => {
     const fake = makeFakeAdapter();
-    const sha = sha256Hex({ role: "user", content: "shadowed" });
     fake.records.set(
       "1789000000000000",
-      JSON.stringify({ id: "a", request: { messages: [`#/0/${sha}`] }, __values__: [] }),
+      JSON.stringify({ id: "a", request: { messages: ["#/0/0"] }, __values__: [] }),
     );
     const store = createRequestDetailsStore({ adapter: fake.adapter, env: {} });
 
     const result = await store.getMany(["1789000000000000"]);
     const detail = result.get("1789000000000000");
-    expect(detail.request.messages).toEqual([`#/0/${sha}`]);
+    // An empty protocol array has no index 0, so the ref stays unresolved.
+    expect(detail.request.messages).toEqual(["#/0/0"]);
     expect(detail.__values__).toEqual([]);
   });
 
-  it("restores local refs and drops only the protocol map, preserving other record fields", async () => {
+  it("restores local refs and drops only the protocol array, preserving other record fields", async () => {
     const fake = makeFakeAdapter();
     const store = createRequestDetailsStore({ adapter: fake.adapter, env: okEnv });
     const message = { role: "assistant", content: "kept" };
@@ -1439,8 +1445,8 @@ describe("Deduplication protocol — existing ref pass-through", () => {
     const fake = makeFakeAdapter();
     const store = createRequestDetailsStore({ adapter: fake.adapter, env: okEnv });
 
-    const existingLocalRef = "#/0/" + "a".repeat(64);
-    const existingCrossRef = "#/1789877312712000/" + "b".repeat(64);
+    const existingLocalRef = "#/0/7";
+    const existingCrossRef = "#/1789877312712000/3";
 
     await store.stage({
       id: "nested-ref",
@@ -1459,7 +1465,7 @@ describe("Deduplication protocol — existing ref pass-through", () => {
     const fake = makeFakeAdapter();
     const store = createRequestDetailsStore({ adapter: fake.adapter, env: okEnv });
 
-    const existingRef = "#/0/" + "c".repeat(64);
+    const existingRef = "#/0/9";
 
     await store.stage({
       id: "nested-tool-ref",
@@ -1479,7 +1485,7 @@ describe("Deduplication protocol — existing ref pass-through", () => {
     const store = createRequestDetailsStore({ adapter: fake.adapter, env: okEnv });
 
     const freshMessage = { role: "user", content: "new" };
-    const existingRef = "#/0/" + "d".repeat(64);
+    const existingRef = "#/0/5";
 
     await store.stage({
       id: "mixed",
@@ -1487,18 +1493,17 @@ describe("Deduplication protocol — existing ref pass-through", () => {
     });
     await store.flush();
 
-    const shaFresh = sha256Hex(freshMessage);
     const written = JSON.parse(fake.records.get(fake.calls.write[0].timestamp.toString()));
     expect(written.request.messages[0]).toBe(existingRef);
-    expect(written.request.messages[1]).toBe(`#/0/${shaFresh}`);
-    expect(written.__values__).toEqual({ [shaFresh]: freshMessage });
+    expect(written.request.messages[1]).toBe("#/0/0");
+    expect(written.__values__).toEqual([freshMessage]);
   });
 
   it("does not create __values__ entries for existing ref strings", async () => {
     const fake = makeFakeAdapter();
     const store = createRequestDetailsStore({ adapter: fake.adapter, env: okEnv });
 
-    const existingRef = "#/1789877312712000/" + "e".repeat(64);
+    const existingRef = "#/1789877312712000/4";
 
     await store.stage({
       id: "no-values",
@@ -1538,7 +1543,7 @@ describe("Deduplication protocol — tools whole-array compression", () => {
     },
   ];
 
-  it("serializes tools as a single #/0/{sha} string with the full array in __values__", async () => {
+  it("serializes tools as a single #/0/{index} string with the full array in __values__", async () => {
     const fake = makeFakeAdapter();
     const store = createRequestDetailsStore({ adapter: fake.adapter, env: okEnv });
 
@@ -1549,17 +1554,14 @@ describe("Deduplication protocol — tools whole-array compression", () => {
     await store.flush();
 
     const written = JSON.parse(fake.records.get(fake.calls.write[0].timestamp.toString()));
-    const shaTools = sha256Hex(toolsArray);
-    const shaMessage = sha256Hex(userMessage);
 
     // tools: single ref string, NOT an array of refs
     expect(typeof written.request.tools).toBe("string");
-    expect(written.request.tools).toBe(`#/0/${shaTools}`);
+    expect(written.request.tools).toBe("#/0/1");
     // messages: still per-item
-    expect(written.request.messages).toEqual([`#/0/${shaMessage}`]);
-    // __values__ holds the complete original tools array under its SHA
-    expect(written.__values__[shaTools]).toEqual(toolsArray);
-    expect(written.__values__[shaMessage]).toEqual(userMessage);
+    expect(written.request.messages).toEqual(["#/0/0"]);
+    // __values__ holds both values in first-seen order
+    expect(written.__values__).toEqual([userMessage, toolsArray]);
   });
 
   it("restores the full tools array on getMany read with no refs leaked", async () => {
@@ -1592,9 +1594,10 @@ describe("Deduplication protocol — tools whole-array compression", () => {
     const pointerB = await store.stage({ id: "b", request: { tools: structuredClone(toolsArray) } });
     await store.flush();
 
-    const shaTools = sha256Hex(toolsArray);
+    // Record A holds only the tools array, so it is local index 0 and the
+    // cross-record ref into A must carry that same index.
     const writtenB = JSON.parse(fake.records.get(fake.calls.write[1].timestamp.toString()));
-    expect(writtenB.request.tools).toBe(`#/${idA}/${shaTools}`);
+    expect(writtenB.request.tools).toBe(`#/${idA}/0`);
     expect(writtenB.__values__).toBeUndefined();
 
     const result = await store.getMany([pointerB.timslite_id]);
@@ -1603,7 +1606,7 @@ describe("Deduplication protocol — tools whole-array compression", () => {
     expect(JSON.stringify(detail)).not.toContain(`#/${idA}/`);
   });
 
-  it("deduplicates tools and messages independently — different SHAs, different value entries", async () => {
+  it("deduplicates tools and messages independently — distinct array indices", async () => {
     const fake = makeFakeAdapter();
     const store = createRequestDetailsStore({ adapter: fake.adapter, env: okEnv });
 
@@ -1621,25 +1624,17 @@ describe("Deduplication protocol — tools whole-array compression", () => {
     await store.flush();
 
     const written = JSON.parse(fake.records.get(fake.calls.write[0].timestamp.toString()));
-    const shaMessage = sha256Hex(userMessage);
-    const shaTools = sha256Hex(toolsArray);
-
-    // Both request and providerRequest tools share the same single ref
-    expect(written.request.tools).toBe(`#/0/${shaTools}`);
-    expect(written.providerRequest.tools).toBe(`#/0/${shaTools}`);
-    // Messages still per-item
-    expect(written.request.messages).toEqual([`#/0/${shaMessage}`]);
-    expect(written.providerRequest.messages).toEqual([`#/0/${shaMessage}`]);
-    // __values__ has exactly two entries: one for the message, one for the tools array
-    expect(Object.keys(written.__values__)).toHaveLength(2);
-    expect(written.__values__[shaTools]).toEqual(toolsArray);
-    expect(written.__values__[shaMessage]).toEqual(userMessage);
+    expect(written.request.tools).toBe("#/0/1");
+    expect(written.providerRequest.tools).toBe("#/0/1");
+    expect(written.request.messages).toEqual(["#/0/0"]);
+    expect(written.providerRequest.messages).toEqual(["#/0/0"]);
+    expect(written.__values__).toEqual([userMessage, toolsArray]);
   });
 
   it("preserves a strict ref string in tools position without re-hashing", async () => {
     const fake = makeFakeAdapter();
     const store = createRequestDetailsStore({ adapter: fake.adapter, env: okEnv });
-    const existingRef = "#/0/" + "f".repeat(64);
+    const existingRef = "#/0/6";
 
     await store.stage({
       id: "ref-pass",
@@ -1689,7 +1684,7 @@ describe("Deduplication protocol — tools whole-array compression", () => {
     const fake = makeFakeAdapter();
     const store = createRequestDetailsStore({ adapter: fake.adapter, env: okEnv });
 
-    const strictRef = `#/42/${"a".repeat(64)}`;
+    const strictRef = "#/42/2";
     await store.stage({
       id: "a",
       request: { tools: strictRef },

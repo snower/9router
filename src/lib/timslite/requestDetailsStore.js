@@ -16,9 +16,11 @@ const DEDUP_FIELDS = ["request", "providerRequest"];
 
 const VALUES_KEY = "__values__";
 
-// Ref wire format "#/<id>/<sha256-hex>" where id=0 means local __values__,
-// nonzero means the timslite_id of the record that owns the value.
-export const TIMSLITE_VALUE_REF_PATTERN = /^#\/(0|[1-9]\d{0,19})\/([a-f0-9]{64})$/;
+// Ref wire format "#/<timslite_id>/<values_index>" with both parts decimal:
+// id=0 means the record's own __values__ array, a nonzero id is another record
+// and the index addresses that record's __values__ array. Ordinary strings and
+// legacy 64-hex refs never match.
+export const TIMSLITE_VALUE_REF_PATTERN = /^#\/(0|[1-9]\d{0,19})\/(0|[1-9]\d*)$/;
 
 export const TIMSLITE_VALUE_CACHE_MAX_ENTRIES = 2048;
 
@@ -47,8 +49,9 @@ export function _resetGlobalValueCache() {
   globalEntries.clear();
 }
 
-// Cache stores { timsliteId, writtenAt } per SHA — never the value itself.
-// Backing map is module-global so values survive across store instances.
+// Cache stores { ref, writtenAt } per SHA — the persisted cross-record ref
+// string, never the value itself. Backing map is module-global so refs survive
+// across store instances.
 export function createValueCache({ maxEntries = TIMSLITE_VALUE_CACHE_MAX_ENTRIES, ttlMicroseconds = 0n, clock = Date.now } = {}) {
   function nowMicros() {
     return BigInt(clock()) * 1000n;
@@ -63,8 +66,8 @@ export function createValueCache({ maxEntries = TIMSLITE_VALUE_CACHE_MAX_ENTRIES
       return ttlMicroseconds > 0n;
     },
     ttlMicroseconds,
-    // Returns the timslite_id string for the cached SHA, or undefined.
-    getTimsliteId(sha) {
+    // Returns the full persisted cross-record ref string for the cached SHA.
+    getRef(sha) {
       if (ttlMicroseconds <= 0n) return undefined;
       const entry = globalEntries.get(sha);
       if (entry === undefined) return undefined;
@@ -75,13 +78,13 @@ export function createValueCache({ maxEntries = TIMSLITE_VALUE_CACHE_MAX_ENTRIES
       // Move to end (most recently used)
       globalEntries.delete(sha);
       globalEntries.set(sha, entry);
-      return entry.timsliteId;
+      return entry.ref;
     },
-    // Store the timslite_id for a SHA after a successful write.
-    setTimsliteId(sha, timsliteId, writtenAtMicros = nowMicros()) {
+    // Store the full cross-record ref string for a SHA after a successful write.
+    setRef(sha, ref, writtenAtMicros = nowMicros()) {
       if (ttlMicroseconds <= 0n) return;
       globalEntries.delete(sha);
-      globalEntries.set(sha, { timsliteId, writtenAt: writtenAtMicros });
+      globalEntries.set(sha, { ref, writtenAt: writtenAtMicros });
       if (globalEntries.size > maxEntries) {
         while (globalEntries.size > maxEntries - 32) {
           const oldest = globalEntries.keys().next().value;
@@ -216,9 +219,9 @@ function isValidDecimalId(id) {
 }
 
 // Replaces each item in request/providerRequest messages/tools with a ref.
-// Local first occurrence: "#/0/{sha}" and value added to __values__[sha].
-// Cross-record cache hit: "#/{timslite_id}/{sha}" (no local value stored).
-// __values__ is an object map { [sha256]: originalItemValue }.
+// Local first occurrence: "#/0/{index}" appended to the __values__ array.
+// Cross-record cache hit: the cached full "#/{timslite_id}/{index}" string is
+// written verbatim (no local value stored).
 // A payload that already occupies the top-level __values__ key is left
 // completely untouched (fail open) so no payload data is overwritten or lost.
 function deduplicateMessages(original, cache) {
@@ -227,9 +230,32 @@ function deduplicateMessages(original, cache) {
   }
 
   const clone = structuredClone(original);
-  const values = Object.create(null);
-  const localShas = new Set();
+  const values = [];
+  const localIndexBySha = new Map();
   const commits = [];
+
+  const resolveRef = (value) => {
+    let serialized;
+    try {
+      serialized = JSON.stringify(value);
+    } catch {
+      return undefined;
+    }
+    if (serialized === undefined) return undefined;
+
+    const sha = sha256Hex(serialized);
+    const localIndex = localIndexBySha.get(sha);
+    if (localIndex !== undefined) return `#/0/${localIndex}`;
+
+    const cachedRef = cache ? cache.getRef(sha) : undefined;
+    if (cachedRef !== undefined) return cachedRef;
+
+    const index = values.length;
+    values.push(structuredClone(value));
+    localIndexBySha.set(sha, index);
+    commits.push({ sha, index });
+    return `#/0/${index}`;
+  };
 
   for (const field of DEDUP_FIELDS) {
     const container = clone[field];
@@ -242,32 +268,8 @@ function deduplicateMessages(original, cache) {
         if (typeof items[i] === "string" && TIMSLITE_VALUE_REF_PATTERN.test(items[i])) {
           continue;
         }
-
-        let serialized;
-        try {
-          serialized = JSON.stringify(items[i]);
-        } catch {
-          continue;
-        }
-        if (serialized === undefined) continue;
-
-        const sha = sha256Hex(serialized);
-
-        if (localShas.has(sha) || sha in values) {
-          items[i] = `#/0/${sha}`;
-          continue;
-        }
-
-        const cachedTimsliteId = cache ? cache.getTimsliteId(sha) : undefined;
-        if (cachedTimsliteId !== undefined) {
-          items[i] = `#/${cachedTimsliteId}/${sha}`;
-          continue;
-        }
-
-        values[sha] = structuredClone(items[i]);
-        localShas.add(sha);
-        commits.push({ sha });
-        items[i] = `#/0/${sha}`;
+        const ref = resolveRef(items[i]);
+        if (ref !== undefined) items[i] = ref;
       }
     }
 
@@ -275,49 +277,26 @@ function deduplicateMessages(original, cache) {
     if (typeof container.tools === "string" && TIMSLITE_VALUE_REF_PATTERN.test(container.tools)) {
       // already a strict ref string — pass through
     } else if (Array.isArray(container.tools)) {
-      let serialized;
-      try {
-        serialized = JSON.stringify(container.tools);
-      } catch {
-        // fail open — leave as-is
-      }
-
-      if (serialized !== undefined) {
-        const sha = sha256Hex(serialized);
-
-        if (localShas.has(sha) || sha in values) {
-          container.tools = `#/0/${sha}`;
-        } else {
-          const cachedTimsliteId = cache ? cache.getTimsliteId(sha) : undefined;
-          if (cachedTimsliteId !== undefined) {
-            container.tools = `#/${cachedTimsliteId}/${sha}`;
-          } else {
-            values[sha] = structuredClone(container.tools);
-            localShas.add(sha);
-            commits.push({ sha });
-            container.tools = `#/0/${sha}`;
-          }
-        }
-      }
+      const ref = resolveRef(container.tools);
+      if (ref !== undefined) container.tools = ref;
     }
   }
 
-  if (localShas.size > 0) clone[VALUES_KEY] = values;
+  if (values.length > 0) clone[VALUES_KEY] = values;
   return { record: clone, commits };
 }
 
 // Resolves refs in a single record's messages/tools using the record's own
-// __values__ plus batch-fetched cross-record payloads. No hash recomputation on
-// read, and no ref is ever rewritten to another form: unknown refs fail open.
-// Only a well-formed protocol map is consumed and removed; any other shape that
-// a payload happens to occupy at __values__ is left untouched.
+// __values__ array plus batch-fetched cross-record arrays. No hash recomputation
+// on read, and no ref is ever rewritten to another form: unknown refs fail open.
+// Only a well-formed protocol array is consumed and removed; any other shape
+// that a payload happens to occupy at __values__ is left untouched.
 async function resolveMessages(record, dataset, log) {
   const rawValues = record[VALUES_KEY];
-  const hasValidLocalValues = typeof rawValues === "object" && rawValues !== null && !Array.isArray(rawValues);
-  const values = hasValidLocalValues ? rawValues : {};
+  const hasValidLocalValues = Array.isArray(rawValues);
+  const values = hasValidLocalValues ? rawValues : [];
 
-  let hasLocalRef = false;
-  const crossRecordRefs = [];
+  const crossRecordIds = new Set();
   for (const field of DEDUP_FIELDS) {
     const container = record[field];
     if (!container || typeof container !== "object") continue;
@@ -327,39 +306,27 @@ async function resolveMessages(record, dataset, log) {
       for (const ref of container.messages) {
         if (typeof ref !== "string") continue;
         const match = TIMSLITE_VALUE_REF_PATTERN.exec(ref);
-        if (!match) continue;
-        if (match[1] === "0") {
-          hasLocalRef = true;
-        } else {
-          crossRecordRefs.push({ id: match[1], sha: match[2] });
-        }
+        if (match && match[1] !== "0") crossRecordIds.add(match[1]);
       }
     }
 
     // tools: scan whole-array ref string
     if (typeof container.tools === "string") {
       const match = TIMSLITE_VALUE_REF_PATTERN.exec(container.tools);
-      if (match) {
-        if (match[1] === "0") {
-          hasLocalRef = true;
-        } else {
-          crossRecordRefs.push({ id: match[1], sha: match[2] });
-        }
-      }
+      if (match && match[1] !== "0") crossRecordIds.add(match[1]);
     }
   }
 
   let crossValues = null;
-  if (crossRecordRefs.length > 0 && dataset) {
-    const uniqueIds = [...new Set(crossRecordRefs.map((r) => r.id))];
+  if (crossRecordIds.size > 0 && dataset) {
     const fetched = new Map();
-    for (const id of uniqueIds) {
+    for (const id of crossRecordIds) {
       try {
         const ts = BigInt(id);
         const rec = await dataset.read(ts);
         if (rec) {
           const parsed = JSON.parse(rec[1].toString("utf8"));
-          if (typeof parsed[VALUES_KEY] === "object" && parsed[VALUES_KEY] !== null && !Array.isArray(parsed[VALUES_KEY])) {
+          if (Array.isArray(parsed[VALUES_KEY])) {
             fetched.set(id, parsed[VALUES_KEY]);
           }
         }
@@ -369,6 +336,18 @@ async function resolveMessages(record, dataset, log) {
     }
     if (fetched.size > 0) crossValues = fetched;
   }
+
+  let resolvedLocalRef = false;
+  const resolveIndex = (id, index) => {
+    if (id === "0") {
+      if (index >= values.length) return undefined;
+      resolvedLocalRef = true;
+      return values[index];
+    }
+    const sourceValues = crossValues ? crossValues.get(id) : undefined;
+    if (!sourceValues || index >= sourceValues.length) return undefined;
+    return sourceValues[index];
+  };
 
   for (const field of DEDUP_FIELDS) {
     const container = record[field];
@@ -382,18 +361,8 @@ async function resolveMessages(record, dataset, log) {
         if (typeof ref !== "string") continue;
         const match = TIMSLITE_VALUE_REF_PATTERN.exec(ref);
         if (!match) continue;
-        const id = match[1];
-        const sha = match[2];
-        if (id === "0") {
-          if (sha in values) {
-            items[i] = values[sha];
-          }
-        } else if (crossValues) {
-          const sourceValues = crossValues.get(id);
-          if (sourceValues && sha in sourceValues) {
-            items[i] = sourceValues[sha];
-          }
-        }
+        const resolved = resolveIndex(match[1], Number(match[2]));
+        if (resolved !== undefined) items[i] = resolved;
       }
     }
 
@@ -401,23 +370,13 @@ async function resolveMessages(record, dataset, log) {
     if (typeof container.tools === "string") {
       const match = TIMSLITE_VALUE_REF_PATTERN.exec(container.tools);
       if (match) {
-        const id = match[1];
-        const sha = match[2];
-        if (id === "0") {
-          if (sha in values) {
-            container.tools = values[sha];
-          }
-        } else if (crossValues) {
-          const sourceValues = crossValues.get(id);
-          if (sourceValues && sha in sourceValues) {
-            container.tools = sourceValues[sha];
-          }
-        }
+        const resolved = resolveIndex(match[1], Number(match[2]));
+        if (resolved !== undefined) container.tools = resolved;
       }
     }
   }
 
-  if (hasValidLocalValues && hasLocalRef) delete record[VALUES_KEY];
+  if (hasValidLocalValues && resolvedLocalRef) delete record[VALUES_KEY];
   return record;
 }
 
@@ -559,21 +518,36 @@ export function createRequestDetailsStore({ adapter, env = process.env, clock, l
       const nowMicros = BigInt(clock ? clock() : Date.now()) * 1000n;
 
       // Update staged record to replace local refs with cross-record refs
-      // for SHAs already written by earlier records in this flush batch.
+      // for values already written by earlier records in this flush batch.
       const recordForWrite = updateStagedRefs(original);
       const { value, commits } = serializeForWrite(recordForWrite);
       await dataset.write(id, Buffer.from(value, "utf8"));
-      for (const { sha } of commits) {
-        valueCache.setTimsliteId(sha, id.toString(), nowMicros);
+      for (const { sha, index } of commits) {
+        valueCache.setRef(sha, `#/${id.toString()}/${index}`, nowMicros);
       }
     }
     await dataset.flush();
     staged.length = 0;
   }
 
-  // Replace #/0/{sha} refs with #/{timslite_id}/{sha} when the SHA was
-  // cached by a previously written record in the same flush batch.
+  // A local ref addresses a value by array index, so the SHA needed for the
+  // cache lookup has to be recomputed from the record's own __values__ array.
   function updateStagedRefs(original) {
+    const localValues = Array.isArray(original[VALUES_KEY]) ? original[VALUES_KEY] : null;
+    if (!localValues) return original;
+
+    const refForIndex = (index) => {
+      if (index >= localValues.length) return undefined;
+      let serialized;
+      try {
+        serialized = JSON.stringify(localValues[index]);
+      } catch {
+        return undefined;
+      }
+      if (serialized === undefined) return undefined;
+      return valueCache.getRef(sha256Hex(serialized));
+    };
+
     let modified = false;
     const clone = structuredClone(original);
     for (const field of DEDUP_FIELDS) {
@@ -588,9 +562,9 @@ export function createRequestDetailsStore({ adapter, env = process.env, clock, l
           if (typeof ref !== "string") continue;
           const match = TIMSLITE_VALUE_REF_PATTERN.exec(ref);
           if (!match || match[1] !== "0") continue;
-          const cachedId = valueCache.getTimsliteId(match[2]);
-          if (cachedId !== undefined) {
-            items[i] = `#/${cachedId}/${match[2]}`;
+          const cachedRef = refForIndex(Number(match[2]));
+          if (cachedRef !== undefined) {
+            items[i] = cachedRef;
             modified = true;
           }
         }
@@ -600,9 +574,9 @@ export function createRequestDetailsStore({ adapter, env = process.env, clock, l
       if (typeof container.tools === "string") {
         const match = TIMSLITE_VALUE_REF_PATTERN.exec(container.tools);
         if (match && match[1] === "0") {
-          const cachedId = valueCache.getTimsliteId(match[2]);
-          if (cachedId !== undefined) {
-            container.tools = `#/${cachedId}/${match[2]}`;
+          const cachedRef = refForIndex(Number(match[2]));
+          if (cachedRef !== undefined) {
+            container.tools = cachedRef;
             modified = true;
           }
         }
