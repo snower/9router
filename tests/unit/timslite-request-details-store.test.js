@@ -1,15 +1,25 @@
+import { createHash } from "node:crypto";
 import path from "node:path";
-import { describe, expect, it } from "vitest";
+import { beforeEach, describe, expect, it } from "vitest";
 import { DB_DIR, TIMSLITE_REQUEST_DETAILS_PATH } from "@/lib/db/paths.js";
 import {
   TIMSLITE_RECORD_MAX_BYTES,
   TIMSLITE_RECORD_SAFE_BYTES,
+  TIMSLITE_VALUE_CACHE_MAX_ENTRIES,
+  TIMSLITE_VALUE_REF_PATTERN,
+  _resetGlobalValueCache,
+  computeCrossRecordTtlMicroseconds,
   createMonotonicMicrosecondId,
   createRequestDetailsStore,
+  createValueCache,
   getTimsliteRetentionDays,
   isTimsliteDataStoreEnabled,
   truncateUtf8Json,
 } from "@/lib/timslite/requestDetailsStore.js";
+
+function sha256Hex(value) {
+  return createHash("sha256").update(JSON.stringify(value), "utf8").digest("hex");
+}
 
 function makeFakeAdapter(options = {}) {
   const records = new Map();
@@ -815,4 +825,879 @@ describe("Timslite writable store flush interval", () => {
       expect(fake.calls.storeOpen[0].config).toMatchObject({ readOnly: false, flushIntervalMs: 15000 });
     }
   );
+});
+
+describe("Message deduplication — refs and local reuse", () => {
+  beforeEach(() => _resetGlobalValueCache());
+  const sharedMessage = { role: "user", content: "hello" };
+
+  it("replaces request.messages items with strict SHA-256 refs backed by __values__ object map", async () => {
+    const fake = makeFakeAdapter();
+    const store = createRequestDetailsStore({
+      adapter: fake.adapter,
+      env: { OBSERVABILITY_TIMSLITE_DATA_STORE: "true" },
+    });
+    await store.stage({ id: "a", request: { messages: [sharedMessage] } });
+    await store.flush();
+
+    const written = JSON.parse(fake.records.get(fake.calls.write[0].timestamp.toString()));
+    const sha = sha256Hex(sharedMessage);
+    expect(written.request.messages).toEqual([`#/0/${sha}`]);
+    expect(written.request.messages[0]).toMatch(TIMSLITE_VALUE_REF_PATTERN);
+    expect(written.__values__).toEqual({ [sha]: sharedMessage });
+  });
+
+  it("reuses one __values__ entry for duplicate messages within a record (local ref)", async () => {
+    const fake = makeFakeAdapter();
+    const store = createRequestDetailsStore({
+      adapter: fake.adapter,
+      env: { OBSERVABILITY_TIMSLITE_DATA_STORE: "true" },
+    });
+    await store.stage({ id: "a", request: { messages: [sharedMessage, structuredClone(sharedMessage)] } });
+    await store.flush();
+
+    const sha = sha256Hex(sharedMessage);
+    const written = JSON.parse(fake.records.get(fake.calls.write[0].timestamp.toString()));
+    expect(written.request.messages).toEqual([`#/0/${sha}`, `#/0/${sha}`]);
+    expect(written.__values__).toEqual({ [sha]: sharedMessage });
+  });
+
+  it("deduplicates request and providerRequest messages independently", async () => {
+    const fake = makeFakeAdapter();
+    const store = createRequestDetailsStore({
+      adapter: fake.adapter,
+      env: { OBSERVABILITY_TIMSLITE_DATA_STORE: "true" },
+    });
+    const providerMessage = { role: "system", content: "sys" };
+    await store.stage({
+      id: "a",
+      request: { messages: [sharedMessage] },
+      providerRequest: { messages: [providerMessage, structuredClone(sharedMessage)] },
+    });
+    await store.flush();
+
+    const shaShared = sha256Hex(sharedMessage);
+    const shaProvider = sha256Hex(providerMessage);
+    const written = JSON.parse(fake.records.get(fake.calls.write[0].timestamp.toString()));
+    expect(written.request.messages).toEqual([`#/0/${shaShared}`]);
+    expect(written.providerRequest.messages[0]).toBe(`#/0/${shaProvider}`);
+    expect(written.providerRequest.messages[1]).toBe(`#/0/${shaShared}`);
+    expect(written.__values__).toEqual({ [shaShared]: sharedMessage, [shaProvider]: providerMessage });
+  });
+
+  it("leaves non-message request fields untouched", async () => {
+    const fake = makeFakeAdapter();
+    const store = createRequestDetailsStore({
+      adapter: fake.adapter,
+      env: { OBSERVABILITY_TIMSLITE_DATA_STORE: "true" },
+    });
+    await store.stage({ id: "a", request: { messages: [sharedMessage], body: "raw" }, response: { messages: [sharedMessage] } });
+    await store.flush();
+
+    const written = JSON.parse(fake.records.get(fake.calls.write[0].timestamp.toString()));
+    expect(written.request.body).toBe("raw");
+    expect(written.response.messages).toEqual([sharedMessage]);
+  });
+});
+
+describe("Message deduplication — cross-record reuse", () => {
+  beforeEach(() => _resetGlobalValueCache());
+  const sharedMessage = { role: "user", content: "shared" };
+
+  it("reuses a value from an earlier record via cross-record ref in the same flush batch", async () => {
+    const fake = makeFakeAdapter();
+    const store = createRequestDetailsStore({
+      adapter: fake.adapter,
+      env: { OBSERVABILITY_TIMSLITE_DATA_STORE: "true" },
+    });
+    await store.stage({ id: "a", request: { messages: [sharedMessage] } });
+    await store.stage({ id: "b", request: { messages: [structuredClone(sharedMessage)] } });
+    await store.flush();
+
+    const sha = sha256Hex(sharedMessage);
+    const firstId = fake.calls.write[0].timestamp.toString();
+    const first = JSON.parse(fake.records.get(firstId));
+    const second = JSON.parse(fake.records.get(fake.calls.write[1].timestamp.toString()));
+    expect(first.request.messages).toEqual([`#/0/${sha}`]);
+    expect(first.__values__).toEqual({ [sha]: sharedMessage });
+    // Second record references the first via cross-record ref
+    expect(second.request.messages).toEqual([`#/${firstId}/${sha}`]);
+    expect(second.__values__).toBeUndefined();
+  });
+
+  it("reuses a value across separate flushes via cross-record cache", async () => {
+    const fake = makeFakeAdapter();
+    const store = createRequestDetailsStore({
+      adapter: fake.adapter,
+      env: { OBSERVABILITY_TIMSLITE_DATA_STORE: "true" },
+    });
+    await store.stage({ id: "a", request: { messages: [sharedMessage] } });
+    await store.flush();
+    const firstId = fake.calls.write[0].timestamp.toString();
+
+    await store.stage({ id: "b", request: { messages: [structuredClone(sharedMessage)] } });
+    await store.flush();
+
+    const sha = sha256Hex(sharedMessage);
+    expect(fake.calls.write).toHaveLength(2);
+    const second = JSON.parse(fake.records.get(fake.calls.write[1].timestamp.toString()));
+    expect(second.request.messages).toEqual([`#/${firstId}/${sha}`]);
+    expect(second.__values__).toBeUndefined();
+  });
+
+  it("emits a ref only after the source record write succeeds", async () => {
+    const fake = makeFakeAdapter();
+    const store = createRequestDetailsStore({
+      adapter: fake.adapter,
+      env: { OBSERVABILITY_TIMSLITE_DATA_STORE: "true" },
+    });
+    await store.stage({ id: "a", request: { messages: [sharedMessage] } });
+    await store.flush();
+    expect(fake.calls.write).toHaveLength(1);
+  });
+
+  it("resolves cross-record refs in a record with no local __values__", async () => {
+    const fake = makeFakeAdapter();
+    const store = createRequestDetailsStore({
+      adapter: fake.adapter,
+      env: { OBSERVABILITY_TIMSLITE_DATA_STORE: "true" },
+    });
+    const msg1 = { role: "user", content: "first" };
+    const msg2 = { role: "user", content: "second" };
+    const msg3 = { role: "assistant", content: "third" };
+
+    // Record A: two distinct messages, both stored locally
+    await store.stage({ id: "a", request: { messages: [msg1, msg2] } });
+    await store.flush();
+    const idA = fake.calls.write[0].timestamp.toString();
+
+    // Record B: all three messages are cross-record refs (msg1, msg2 from A, msg3 novel)
+    // msg3 will be stored locally in B since it is novel
+    await store.stage({ id: "b", request: { messages: [structuredClone(msg1), structuredClone(msg2), msg3] } });
+    await store.flush();
+    const idB = fake.calls.write[1].timestamp.toString();
+
+    // Verify record B has cross-record refs for msg1/msg2 and local ref for msg3
+    const sha1 = sha256Hex(msg1);
+    const sha2 = sha256Hex(msg2);
+    const sha3 = sha256Hex(msg3);
+    const writtenB = JSON.parse(fake.records.get(idB));
+    expect(writtenB.request.messages[0]).toBe(`#/${idA}/${sha1}`);
+    expect(writtenB.request.messages[1]).toBe(`#/${idA}/${sha2}`);
+    expect(writtenB.request.messages[2]).toBe(`#/0/${sha3}`);
+    expect(writtenB.__values__).toEqual({ [sha3]: msg3 });
+
+    // getMany must fully restore all three messages in record B
+    const result = await store.getMany([idB]);
+    expect(result.get(idB)).toEqual({
+      id: "b",
+      request: { messages: [msg1, msg2, msg3] },
+    });
+    expect(result.get(idB).__values__).toBeUndefined();
+  });
+});
+
+describe("Message deduplication — transparent read resolution", () => {
+  beforeEach(() => _resetGlobalValueCache());
+  const sharedMessage = { role: "user", content: "roundtrip" };
+
+  it("rehydrates refs in getMany and strips __values__", async () => {
+    const fake = makeFakeAdapter();
+    const store = createRequestDetailsStore({
+      adapter: fake.adapter,
+      env: { OBSERVABILITY_TIMSLITE_DATA_STORE: "true" },
+    });
+    const pointer = await store.stage({ id: "a", request: { messages: [sharedMessage] } });
+    await store.flush();
+
+    const result = await store.getMany([pointer.timslite_id]);
+    expect(result.get(pointer.timslite_id)).toEqual({ id: "a", request: { messages: [sharedMessage] } });
+    expect(result.get(pointer.timslite_id).__values__).toBeUndefined();
+  });
+
+  it("rehydrates cross-record refs across a batch read", async () => {
+    const fake = makeFakeAdapter();
+    const store = createRequestDetailsStore({
+      adapter: fake.adapter,
+      env: { OBSERVABILITY_TIMSLITE_DATA_STORE: "true" },
+    });
+    const p1 = await store.stage({ id: "a", request: { messages: [sharedMessage] } });
+    const p2 = await store.stage({ id: "b", request: { messages: [structuredClone(sharedMessage), { role: "assistant", content: "hi" }] } });
+    await store.flush();
+
+    const result = await store.getMany([p1.timslite_id, p2.timslite_id]);
+    expect(result.get(p1.timslite_id)).toEqual({ id: "a", request: { messages: [sharedMessage] } });
+    expect(result.get(p2.timslite_id)).toEqual({
+      id: "b",
+      request: { messages: [sharedMessage, { role: "assistant", content: "hi" }] },
+    });
+  });
+
+  it("passes records without refs through unchanged", async () => {
+    const fake = makeFakeAdapter();
+    const store = createRequestDetailsStore({
+      adapter: fake.adapter,
+      env: { OBSERVABILITY_TIMSLITE_DATA_STORE: "true" },
+    });
+    const pointer = await store.stage({ id: "plain", request: { body: "no messages" } });
+    await store.flush();
+
+    const result = await store.getMany([pointer.timslite_id]);
+    expect(result.get(pointer.timslite_id)).toEqual({ id: "plain", request: { body: "no messages" } });
+  });
+
+  it("leaves a ref with an unknown SHA unresolved and strips __values__ (fail open)", async () => {
+    const fake = makeFakeAdapter();
+    const badSha = "0".repeat(64);
+    const record = { id: "corrupt", request: { messages: [`#/0/${badSha}`] }, __values__: {} };
+    fake.records.set("123456", JSON.stringify(record));
+    const store = createRequestDetailsStore({ adapter: fake.adapter, env: {} });
+
+    const result = await store.getMany(["123456"]);
+    expect(result.get("123456").request.messages).toEqual([`#/0/${badSha}`]);
+    expect(result.get("123456").__values__).toBeUndefined();
+  });
+
+  it("rejects non-strict ref forms", () => {
+    expect(TIMSLITE_VALUE_REF_PATTERN.test(`#/0/${"a".repeat(64)}`)).toBe(true);
+    expect(TIMSLITE_VALUE_REF_PATTERN.test(`#/00/${"a".repeat(64)}`)).toBe(false);
+    expect(TIMSLITE_VALUE_REF_PATTERN.test(`#/1/${"A".repeat(64)}`)).toBe(false);
+    expect(TIMSLITE_VALUE_REF_PATTERN.test("#/1/short")).toBe(false);
+    expect(TIMSLITE_VALUE_REF_PATTERN.test(`x#/1/${"a".repeat(64)}`)).toBe(false);
+  });
+});
+
+describe("Cross-record cache — TTL and LRU bounds", () => {
+  beforeEach(() => _resetGlobalValueCache());
+  const HOUR_US = 60n * 60n * 1_000_000n;
+
+  it("is capped at 48h and disabled when the budget is non-positive", () => {
+    const sevenDays = 7n * 24n * HOUR_US;
+    expect(computeCrossRecordTtlMicroseconds(sevenDays)).toBe(48n * HOUR_US);
+    expect(computeCrossRecordTtlMicroseconds(24n * HOUR_US)).toBe(23n * HOUR_US);
+    expect(computeCrossRecordTtlMicroseconds(HOUR_US)).toBe(0n);
+    expect(computeCrossRecordTtlMicroseconds(0n)).toBe(0n);
+  });
+
+  it("expires entries once the retention-minus-safety window elapses", () => {
+    let nowMs = 1_000_000;
+    const cache = createValueCache({ ttlMicroseconds: 48n * HOUR_US, clock: () => nowMs });
+    const sha = "a".repeat(64);
+    cache.setTimsliteId(sha, "100000");
+    expect(cache.getTimsliteId(sha)).toBe("100000");
+
+    nowMs += Number(47n * HOUR_US / 1000n);
+    expect(cache.getTimsliteId(sha)).toBe("100000");
+
+    nowMs += Number(2n * HOUR_US / 1000n);
+    expect(cache.getTimsliteId(sha)).toBeUndefined();
+  });
+
+  it("is disabled for a non-positive TTL", () => {
+    const cache = createValueCache({ ttlMicroseconds: 0n });
+    cache.setTimsliteId("a".repeat(64), "100000");
+    expect(cache.getTimsliteId("a".repeat(64))).toBeUndefined();
+    expect(cache.size).toBe(0);
+  });
+
+  it("evicts the least recently used entry past the 2048 bound", () => {
+    const cache = createValueCache({ maxEntries: 2, ttlMicroseconds: 48n * HOUR_US });
+    cache.setTimsliteId("a".repeat(64), "1");
+    cache.setTimsliteId("b".repeat(64), "2");
+    expect(cache.getTimsliteId("a".repeat(64))).toBe("1");
+    cache.setTimsliteId("c".repeat(64), "3");
+
+    expect(cache.size).toBe(2);
+    expect(cache.getTimsliteId("b".repeat(64))).toBeUndefined();
+    expect(cache.getTimsliteId("a".repeat(64))).toBe("1");
+    expect(cache.getTimsliteId("c".repeat(64))).toBe("3");
+  });
+
+  it("defaults the cache bound to 2048 entries", () => {
+    expect(TIMSLITE_VALUE_CACHE_MAX_ENTRIES).toBe(2048);
+    const cache = createValueCache({ ttlMicroseconds: 48n * HOUR_US });
+    for (let i = 0; i < 2048; i += 1) cache.setTimsliteId(i.toString(16).padStart(64, "0"), i.toString());
+    expect(cache.size).toBe(2048);
+    cache.setTimsliteId("f".repeat(64), "99");
+    expect(cache.size).toBe(2048);
+  });
+});
+
+describe("Global value cache — cross-instance reuse", () => {
+  const HOUR_US = 60n * 60n * 1_000_000n;
+
+  it("values written by one store instance are visible to a later instance", () => {
+    _resetGlobalValueCache();
+    const sha = "a".repeat(64);
+    const nowMs = 1_000_000;
+
+    const cache1 = createValueCache({ ttlMicroseconds: 48n * HOUR_US, clock: () => nowMs });
+    cache1.setTimsliteId(sha, "100", BigInt(nowMs) * 1000n);
+
+    // Simulate a new store instance opening later
+    const laterMs = nowMs + 1000;
+    const cache2 = createValueCache({ ttlMicroseconds: 48n * HOUR_US, clock: () => laterMs });
+    expect(cache2.getTimsliteId(sha)).toBe("100");
+
+    _resetGlobalValueCache();
+  });
+
+  it("shorter TTL in later instance correctly expires an entry", () => {
+    _resetGlobalValueCache();
+    const sha = "b".repeat(64);
+    const nowMs = 1_000_000;
+
+    // First instance writes with 48h TTL
+    const cache1 = createValueCache({ ttlMicroseconds: 48n * HOUR_US, clock: () => nowMs });
+    cache1.setTimsliteId(sha, "200", BigInt(nowMs) * 1000n);
+
+    // Second instance has only 1h TTL; entry written 2h ago is expired
+    const twoHoursLaterMs = nowMs + Number(2n * HOUR_US / 1000n);
+    const cache2 = createValueCache({ ttlMicroseconds: 1n * HOUR_US, clock: () => twoHoursLaterMs });
+    expect(cache2.getTimsliteId(sha)).toBeUndefined();
+
+    _resetGlobalValueCache();
+  });
+
+  it("second store emits cross-record ref for SHA written by first store", async () => {
+    _resetGlobalValueCache();
+    const fake = makeFakeAdapter();
+    const sharedMessage = { role: "user", content: "cross-instance" };
+    const sha = sha256Hex(sharedMessage);
+
+    // First store writes record A with the message
+    const store1 = createRequestDetailsStore({
+      adapter: fake.adapter,
+      env: { OBSERVABILITY_TIMSLITE_DATA_STORE: "true" },
+    });
+    await store1.stage({ id: "a", request: { messages: [sharedMessage] } });
+    await store1.flush();
+    const idA = fake.calls.write[0].timestamp.toString();
+
+    // Second store (new instance, same process) stages the same message
+    const store2 = createRequestDetailsStore({
+      adapter: fake.adapter,
+      env: { OBSERVABILITY_TIMSLITE_DATA_STORE: "true" },
+    });
+    await store2.stage({ id: "b", request: { messages: [structuredClone(sharedMessage)] } });
+    await store2.flush();
+
+    // Record B should have a cross-record ref to A, not a local entry
+    const writtenB = JSON.parse(fake.records.get(fake.calls.write[1].timestamp.toString()));
+    expect(writtenB.request.messages).toEqual([`#/${idA}/${sha}`]);
+    expect(writtenB.__values__).toBeUndefined();
+
+    // getMany must still fully restore the message
+    const result = await store2.getMany([fake.calls.write[1].timestamp.toString()]);
+    expect(result.get(fake.calls.write[1].timestamp.toString())).toEqual({
+      id: "b",
+      request: { messages: [sharedMessage] },
+    });
+
+    _resetGlobalValueCache();
+  });
+});
+
+describe("Message deduplication — oversized fallback and fail-open", () => {
+  beforeEach(() => _resetGlobalValueCache());
+  it("falls back to truncating the original (no refs) when the compressed JSON exceeds the safe size", async () => {
+    const fake = makeFakeAdapter();
+    const bigMessage = { role: "user", content: "x".repeat(TIMSLITE_RECORD_MAX_BYTES) };
+    const store = createRequestDetailsStore({
+      adapter: fake.adapter,
+      env: { OBSERVABILITY_TIMSLITE_DATA_STORE: "true" },
+    });
+    await store.stage({ id: "big", request: { messages: [bigMessage] } });
+    await store.flush();
+
+    const stored = fake.calls.write[0].data;
+    expect(stored.byteLength).toBeLessThanOrEqual(TIMSLITE_RECORD_SAFE_BYTES);
+    const parsed = JSON.parse(stored.toString("utf8"));
+    expect(parsed.__truncated).toBe(true);
+    expect(parsed.__values__).toBeUndefined();
+  });
+
+  it("does not commit cache entries for an oversized fallback record", async () => {
+    const fake = makeFakeAdapter();
+    const bigMessage = { role: "user", content: "x".repeat(TIMSLITE_RECORD_MAX_BYTES) };
+    const store = createRequestDetailsStore({
+      adapter: fake.adapter,
+      env: { OBSERVABILITY_TIMSLITE_DATA_STORE: "true" },
+    });
+    await store.stage({ id: "big", request: { messages: [bigMessage] } });
+    await store.flush();
+    await store.stage({ id: "after", request: { messages: [bigMessage] } });
+    await store.flush();
+
+    const second = JSON.parse(fake.records.get(fake.calls.write[1].timestamp.toString()));
+    expect(second.__truncated).toBe(true);
+    expect(second.request.messages).toBeUndefined();
+  });
+
+  it("is JSON parseable and rehydrates round-trip for a compressed record", async () => {
+    const fake = makeFakeAdapter();
+    const store = createRequestDetailsStore({
+      adapter: fake.adapter,
+      env: { OBSERVABILITY_TIMSLITE_DATA_STORE: "true" },
+    });
+    const messages = Array.from({ length: 50 }, (_, i) => ({ role: "user", content: `m${i}` }));
+    const pointer = await store.stage({ id: "roundtrip", providerRequest: { messages } });
+    await store.flush();
+
+    const result = await store.getMany([pointer.timslite_id]);
+    expect(result.get(pointer.timslite_id).providerRequest.messages).toEqual(messages);
+  });
+});
+
+describe("Deduplication protocol — generalized to tools arrays", () => {
+  beforeEach(() => _resetGlobalValueCache());
+
+  const okEnv = { OBSERVABILITY_TIMSLITE_DATA_STORE: "true" };
+  const userMessage = { role: "user", content: "hi" };
+  const sharedTool = {
+    type: "function",
+    function: {
+      name: "get_weather",
+      description: "Get the weather for a city",
+      parameters: { type: "object", properties: { city: { type: "string" } }, required: ["city"] },
+    },
+  };
+
+  it("deduplicates a tools item alongside a message in the same request record", async () => {
+    const fake = makeFakeAdapter();
+    const store = createRequestDetailsStore({ adapter: fake.adapter, env: okEnv });
+
+    await store.stage({
+      id: "a",
+      request: { model: "gpt-4", messages: [userMessage], tools: [structuredClone(sharedTool)] },
+      providerRequest: { model: "gpt-4", messages: [structuredClone(userMessage)], tools: [structuredClone(sharedTool)] },
+    });
+    await store.flush();
+
+    const written = JSON.parse(fake.records.get(fake.calls.write[0].timestamp.toString()));
+    const shaMessage = sha256Hex(userMessage);
+    const shaTools = sha256Hex([sharedTool]);
+
+    expect(written.request.messages).toEqual([`#/0/${shaMessage}`]);
+    expect(written.request.tools).toBe(`#/0/${shaTools}`);
+    expect(written.providerRequest.messages).toEqual([`#/0/${shaMessage}`]);
+    expect(written.providerRequest.tools).toBe(`#/0/${shaTools}`);
+    expect(written.__values__[shaMessage]).toEqual(userMessage);
+    expect(written.__values__[shaTools]).toEqual([sharedTool]);
+  });
+
+  it("restores a locally deduplicated tools item and message on read with no refs leaked", async () => {
+    const fake = makeFakeAdapter();
+    const store = createRequestDetailsStore({ adapter: fake.adapter, env: okEnv });
+
+    const pointer = await store.stage({
+      id: "a",
+      request: { messages: [userMessage], tools: [structuredClone(sharedTool)] },
+    });
+    await store.flush();
+
+    const result = await store.getMany([pointer.timslite_id]);
+    const detail = result.get(pointer.timslite_id);
+
+    expect(detail).toEqual({ id: "a", request: { messages: [userMessage], tools: [sharedTool] } });
+    expect(detail.request.messages).toEqual([userMessage]);
+    expect(detail.request.tools).toEqual([sharedTool]);
+    expect(JSON.stringify(detail)).not.toContain("#/0/");
+    expect(detail.__values__).toBeUndefined();
+    expect(detail.request.__values__).toBeUndefined();
+  });
+
+  it("restores a locally deduplicated tools item that appears only in providerRequest", async () => {
+    const fake = makeFakeAdapter();
+    const store = createRequestDetailsStore({ adapter: fake.adapter, env: okEnv });
+
+    const pointer = await store.stage({
+      id: "a",
+      request: { body: "no tools here" },
+      providerRequest: { messages: [structuredClone(userMessage)], tools: [structuredClone(sharedTool)] },
+    });
+    await store.flush();
+
+    const result = await store.getMany([pointer.timslite_id]);
+    expect(result.get(pointer.timslite_id)).toEqual({
+      id: "a",
+      request: { body: "no tools here" },
+      providerRequest: { messages: [userMessage], tools: [sharedTool] },
+    });
+  });
+
+  it("restores a cross-record tools item in the same read batch", async () => {
+    const fake = makeFakeAdapter();
+    const store = createRequestDetailsStore({ adapter: fake.adapter, env: okEnv });
+
+    await store.stage({ id: "a", request: { messages: [userMessage], tools: [structuredClone(sharedTool)] } });
+    await store.flush();
+    const idA = fake.calls.write[0].timestamp.toString();
+
+    const pointerB = await store.stage({ id: "b", request: { messages: [structuredClone(userMessage)], tools: [structuredClone(sharedTool)] } });
+    await store.flush();
+
+    const shaTools = sha256Hex([sharedTool]);
+    const writtenB = JSON.parse(fake.records.get(fake.calls.write[1].timestamp.toString()));
+    expect(writtenB.request.tools).toBe(`#/${idA}/${shaTools}`);
+
+    const result = await store.getMany([pointerB.timslite_id]);
+    const detail = result.get(pointerB.timslite_id);
+    expect(detail).toEqual({ id: "b", request: { messages: [userMessage], tools: [sharedTool] } });
+    expect(JSON.stringify(detail)).not.toContain(`#/${idA}/`);
+  });
+
+  it("does not touch a tools-like field outside request/providerRequest", async () => {
+    const fake = makeFakeAdapter();
+    const store = createRequestDetailsStore({ adapter: fake.adapter, env: okEnv });
+
+    await store.stage({
+      id: "a",
+      request: { tools: [structuredClone(sharedTool)] },
+      response: { tools: [structuredClone(sharedTool)] },
+    });
+    await store.flush();
+
+    const written = JSON.parse(fake.records.get(fake.calls.write[0].timestamp.toString()));
+    expect(written.response.tools).toEqual([sharedTool]);
+  });
+
+  it("keeps a non-array tools field untouched (fail open)", async () => {
+    const fake = makeFakeAdapter();
+    const store = createRequestDetailsStore({ adapter: fake.adapter, env: okEnv });
+
+    await store.stage({ id: "a", request: { messages: [userMessage], tools: "not-an-array" } });
+    await store.flush();
+
+    const written = JSON.parse(fake.records.get(fake.calls.write[0].timestamp.toString()));
+    expect(written.request.tools).toBe("not-an-array");
+    expect(written.request.messages).toEqual([`#/0/${sha256Hex(userMessage)}`]);
+  });
+});
+
+describe("Deduplication protocol — __values__ collision hardening", () => {
+  beforeEach(() => _resetGlobalValueCache());
+
+  const okEnv = { OBSERVABILITY_TIMSLITE_DATA_STORE: "true" };
+
+  it("does not leak local refs when the payload already contains a top-level __values__ field", async () => {
+    const fake = makeFakeAdapter();
+    const store = createRequestDetailsStore({ adapter: fake.adapter, env: okEnv });
+    const message = { role: "user", content: "collision" };
+
+    const pointer = await store.stage({
+      id: "a",
+      request: { messages: [message] },
+      __values__: { user: "pre-existing" },
+    });
+    await store.flush();
+
+    const result = await store.getMany([pointer.timslite_id]);
+    const detail = result.get(pointer.timslite_id);
+
+    expect(detail.request.messages).toEqual([message]);
+    expect(JSON.stringify(detail)).not.toContain("#/0/");
+    expect(detail.__values__).toEqual({ user: "pre-existing" });
+  });
+
+  it("resolves local refs against the protocol value map even when the payload shadows __values__", async () => {
+    const fake = makeFakeAdapter();
+    const sha = sha256Hex({ role: "user", content: "shadowed" });
+    fake.records.set(
+      "1789000000000000",
+      JSON.stringify({ id: "a", request: { messages: [`#/0/${sha}`] }, __values__: [] }),
+    );
+    const store = createRequestDetailsStore({ adapter: fake.adapter, env: {} });
+
+    const result = await store.getMany(["1789000000000000"]);
+    const detail = result.get("1789000000000000");
+    expect(detail.request.messages).toEqual([`#/0/${sha}`]);
+    expect(detail.__values__).toEqual([]);
+  });
+
+  it("restores local refs and drops only the protocol map, preserving other record fields", async () => {
+    const fake = makeFakeAdapter();
+    const store = createRequestDetailsStore({ adapter: fake.adapter, env: okEnv });
+    const message = { role: "assistant", content: "kept" };
+
+    const pointer = await store.stage({ id: "a", provider: "openai", request: { messages: [message] } });
+    await store.flush();
+
+    const result = await store.getMany([pointer.timslite_id]);
+    const detail = result.get(pointer.timslite_id);
+    expect(detail).toEqual({ id: "a", provider: "openai", request: { messages: [message] } });
+    expect(detail.__values__).toBeUndefined();
+  });
+});
+
+describe("Deduplication protocol — existing ref pass-through", () => {
+  beforeEach(() => _resetGlobalValueCache());
+
+  const okEnv = { OBSERVABILITY_TIMSLITE_DATA_STORE: "true" };
+
+  it("preserves strict ref strings in messages without re-hashing", async () => {
+    const fake = makeFakeAdapter();
+    const store = createRequestDetailsStore({ adapter: fake.adapter, env: okEnv });
+
+    const existingLocalRef = "#/0/" + "a".repeat(64);
+    const existingCrossRef = "#/1789877312712000/" + "b".repeat(64);
+
+    await store.stage({
+      id: "nested-ref",
+      request: { messages: [existingLocalRef, existingCrossRef] },
+      providerRequest: { messages: [existingLocalRef, existingCrossRef] },
+    });
+    await store.flush();
+
+    const written = JSON.parse(fake.records.get(fake.calls.write[0].timestamp.toString()));
+    expect(written.request.messages).toEqual([existingLocalRef, existingCrossRef]);
+    expect(written.providerRequest.messages).toEqual([existingLocalRef, existingCrossRef]);
+    expect(written.__values__).toBeUndefined();
+  });
+
+  it("preserves strict ref strings in tools without re-hashing", async () => {
+    const fake = makeFakeAdapter();
+    const store = createRequestDetailsStore({ adapter: fake.adapter, env: okEnv });
+
+    const existingRef = "#/0/" + "c".repeat(64);
+
+    await store.stage({
+      id: "nested-tool-ref",
+      request: { tools: existingRef },
+      providerRequest: { tools: existingRef },
+    });
+    await store.flush();
+
+    const written = JSON.parse(fake.records.get(fake.calls.write[0].timestamp.toString()));
+    expect(written.request.tools).toBe(existingRef);
+    expect(written.providerRequest.tools).toBe(existingRef);
+    expect(written.__values__).toBeUndefined();
+  });
+
+  it("mixes existing refs with fresh items — only fresh items get hashed", async () => {
+    const fake = makeFakeAdapter();
+    const store = createRequestDetailsStore({ adapter: fake.adapter, env: okEnv });
+
+    const freshMessage = { role: "user", content: "new" };
+    const existingRef = "#/0/" + "d".repeat(64);
+
+    await store.stage({
+      id: "mixed",
+      request: { messages: [existingRef, freshMessage] },
+    });
+    await store.flush();
+
+    const shaFresh = sha256Hex(freshMessage);
+    const written = JSON.parse(fake.records.get(fake.calls.write[0].timestamp.toString()));
+    expect(written.request.messages[0]).toBe(existingRef);
+    expect(written.request.messages[1]).toBe(`#/0/${shaFresh}`);
+    expect(written.__values__).toEqual({ [shaFresh]: freshMessage });
+  });
+
+  it("does not create __values__ entries for existing ref strings", async () => {
+    const fake = makeFakeAdapter();
+    const store = createRequestDetailsStore({ adapter: fake.adapter, env: okEnv });
+
+    const existingRef = "#/1789877312712000/" + "e".repeat(64);
+
+    await store.stage({
+      id: "no-values",
+      request: { messages: [existingRef] },
+      providerRequest: { messages: [existingRef] },
+    });
+    await store.flush();
+
+    const written = JSON.parse(fake.records.get(fake.calls.write[0].timestamp.toString()));
+    expect(written.__values__).toBeUndefined();
+    expect(written.request.messages).toEqual([existingRef]);
+    expect(written.providerRequest.messages).toEqual([existingRef]);
+  });
+});
+
+describe("Deduplication protocol — tools whole-array compression", () => {
+  beforeEach(() => _resetGlobalValueCache());
+
+  const okEnv = { OBSERVABILITY_TIMSLITE_DATA_STORE: "true" };
+  const userMessage = { role: "user", content: "hi" };
+  const toolsArray = [
+    {
+      type: "function",
+      function: {
+        name: "get_weather",
+        description: "Get the weather for a city",
+        parameters: { type: "object", properties: { city: { type: "string" } }, required: ["city"] },
+      },
+    },
+    {
+      type: "function",
+      function: {
+        name: "get_time",
+        description: "Get the current time",
+        parameters: { type: "object", properties: { timezone: { type: "string" } } },
+      },
+    },
+  ];
+
+  it("serializes tools as a single #/0/{sha} string with the full array in __values__", async () => {
+    const fake = makeFakeAdapter();
+    const store = createRequestDetailsStore({ adapter: fake.adapter, env: okEnv });
+
+    await store.stage({
+      id: "a",
+      request: { model: "gpt-4", messages: [userMessage], tools: structuredClone(toolsArray) },
+    });
+    await store.flush();
+
+    const written = JSON.parse(fake.records.get(fake.calls.write[0].timestamp.toString()));
+    const shaTools = sha256Hex(toolsArray);
+    const shaMessage = sha256Hex(userMessage);
+
+    // tools: single ref string, NOT an array of refs
+    expect(typeof written.request.tools).toBe("string");
+    expect(written.request.tools).toBe(`#/0/${shaTools}`);
+    // messages: still per-item
+    expect(written.request.messages).toEqual([`#/0/${shaMessage}`]);
+    // __values__ holds the complete original tools array under its SHA
+    expect(written.__values__[shaTools]).toEqual(toolsArray);
+    expect(written.__values__[shaMessage]).toEqual(userMessage);
+  });
+
+  it("restores the full tools array on getMany read with no refs leaked", async () => {
+    const fake = makeFakeAdapter();
+    const store = createRequestDetailsStore({ adapter: fake.adapter, env: okEnv });
+
+    const pointer = await store.stage({
+      id: "a",
+      request: { messages: [userMessage], tools: structuredClone(toolsArray) },
+    });
+    await store.flush();
+
+    const result = await store.getMany([pointer.timslite_id]);
+    const detail = result.get(pointer.timslite_id);
+
+    expect(detail.request.tools).toEqual(toolsArray);
+    expect(detail.request.messages).toEqual([userMessage]);
+    expect(JSON.stringify(detail)).not.toContain("#/0/");
+    expect(detail.__values__).toBeUndefined();
+  });
+
+  it("uses cross-record ref for tools when same array was previously written", async () => {
+    const fake = makeFakeAdapter();
+    const store = createRequestDetailsStore({ adapter: fake.adapter, env: okEnv });
+
+    await store.stage({ id: "a", request: { tools: structuredClone(toolsArray) } });
+    await store.flush();
+    const idA = fake.calls.write[0].timestamp.toString();
+
+    const pointerB = await store.stage({ id: "b", request: { tools: structuredClone(toolsArray) } });
+    await store.flush();
+
+    const shaTools = sha256Hex(toolsArray);
+    const writtenB = JSON.parse(fake.records.get(fake.calls.write[1].timestamp.toString()));
+    expect(writtenB.request.tools).toBe(`#/${idA}/${shaTools}`);
+    expect(writtenB.__values__).toBeUndefined();
+
+    const result = await store.getMany([pointerB.timslite_id]);
+    const detail = result.get(pointerB.timslite_id);
+    expect(detail.request.tools).toEqual(toolsArray);
+    expect(JSON.stringify(detail)).not.toContain(`#/${idA}/`);
+  });
+
+  it("deduplicates tools and messages independently — different SHAs, different value entries", async () => {
+    const fake = makeFakeAdapter();
+    const store = createRequestDetailsStore({ adapter: fake.adapter, env: okEnv });
+
+    await store.stage({
+      id: "a",
+      request: {
+        messages: [userMessage],
+        tools: structuredClone(toolsArray),
+      },
+      providerRequest: {
+        messages: [structuredClone(userMessage)],
+        tools: structuredClone(toolsArray),
+      },
+    });
+    await store.flush();
+
+    const written = JSON.parse(fake.records.get(fake.calls.write[0].timestamp.toString()));
+    const shaMessage = sha256Hex(userMessage);
+    const shaTools = sha256Hex(toolsArray);
+
+    // Both request and providerRequest tools share the same single ref
+    expect(written.request.tools).toBe(`#/0/${shaTools}`);
+    expect(written.providerRequest.tools).toBe(`#/0/${shaTools}`);
+    // Messages still per-item
+    expect(written.request.messages).toEqual([`#/0/${shaMessage}`]);
+    expect(written.providerRequest.messages).toEqual([`#/0/${shaMessage}`]);
+    // __values__ has exactly two entries: one for the message, one for the tools array
+    expect(Object.keys(written.__values__)).toHaveLength(2);
+    expect(written.__values__[shaTools]).toEqual(toolsArray);
+    expect(written.__values__[shaMessage]).toEqual(userMessage);
+  });
+
+  it("preserves a strict ref string in tools position without re-hashing", async () => {
+    const fake = makeFakeAdapter();
+    const store = createRequestDetailsStore({ adapter: fake.adapter, env: okEnv });
+    const existingRef = "#/0/" + "f".repeat(64);
+
+    await store.stage({
+      id: "ref-pass",
+      request: { tools: existingRef },
+      providerRequest: { tools: existingRef },
+    });
+    await store.flush();
+
+    const written = JSON.parse(fake.records.get(fake.calls.write[0].timestamp.toString()));
+    expect(written.request.tools).toBe(existingRef);
+    expect(written.providerRequest.tools).toBe(existingRef);
+    expect(written.__values__).toBeUndefined();
+  });
+
+  it("resolves a cross-record tools ref string in getMany", async () => {
+    const fake = makeFakeAdapter();
+    const store = createRequestDetailsStore({ adapter: fake.adapter, env: okEnv });
+
+    // Record A has the tools locally
+    const pointerA = await store.stage({ id: "a", request: { tools: structuredClone(toolsArray) } });
+    await store.flush();
+
+    // Record B references A's tools via cross-record ref
+    const pointerB = await store.stage({ id: "b", request: { tools: structuredClone(toolsArray) } });
+    await store.flush();
+
+    const result = await store.getMany([pointerA.timslite_id, pointerB.timslite_id]);
+    expect(result.get(pointerA.timslite_id).request.tools).toEqual(toolsArray);
+    expect(result.get(pointerB.timslite_id).request.tools).toEqual(toolsArray);
+  });
+
+  it("leaves a non-string, non-array tools field untouched (fail open)", async () => {
+    const fake = makeFakeAdapter();
+    const store = createRequestDetailsStore({ adapter: fake.adapter, env: okEnv });
+
+    await store.stage({
+      id: "a",
+      request: { tools: 42 },
+    });
+    await store.flush();
+
+    const written = JSON.parse(fake.records.get(fake.calls.write[0].timestamp.toString()));
+    expect(written.request.tools).toBe(42);
+  });
+
+  it("passes through an existing strict tools ref string unchanged with no __values__", async () => {
+    const fake = makeFakeAdapter();
+    const store = createRequestDetailsStore({ adapter: fake.adapter, env: okEnv });
+
+    const strictRef = `#/42/${"a".repeat(64)}`;
+    await store.stage({
+      id: "a",
+      request: { tools: strictRef },
+    });
+    await store.flush();
+
+    const written = JSON.parse(fake.records.get(fake.calls.write[0].timestamp.toString()));
+    expect(written.request.tools).toBe(strictRef);
+    expect(written.__values__).toBeUndefined();
+  });
 });
