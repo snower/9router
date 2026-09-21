@@ -435,7 +435,7 @@ export async function getRequestDetails(filter = {}) {
     try {
       const store = await getTimsliteStore();
       if (store) {
-        hydratedData = await store.getMany([...new Set(pointerIds)]);
+        hydratedData = await store.getMany([...new Set(pointerIds)], { resolveValues: false });
       }
     } catch (err) {
       console.warn("[requestDetailsRepo] Timslite batch read failed:", err.message);
