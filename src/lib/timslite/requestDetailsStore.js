@@ -589,7 +589,7 @@ export function createRequestDetailsStore({ adapter, env = process.env, clock, l
     staged.length = 0;
   }
 
-  async function getMany(ids) {
+  async function getMany(ids, { resolveValues = true } = {}) {
     const result = new Map();
     if (ids.length === 0) return result;
 
@@ -623,8 +623,8 @@ export function createRequestDetailsStore({ adapter, env = process.env, clock, l
           if (!record) {
             continue;
           }
-          const parsed = await resolveMessages(JSON.parse(record[1].toString("utf8")), dataset, log);
-          result.set(id, parsed);
+          const parsed = JSON.parse(record[1].toString("utf8"));
+          result.set(id, resolveValues ? await resolveMessages(parsed, dataset, log) : parsed);
         } catch (err) {
           log.warn("timslite.read", { id, error: err.message });
         }

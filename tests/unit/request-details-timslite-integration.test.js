@@ -386,6 +386,42 @@ describe("requestDetailsRepo Timslite integration", () => {
       expect(fakeTimslite.calls.storeOpen).toHaveLength(1);
     });
 
+    it("passes resolveValues: false when hydrating the list read", async () => {
+      process.env.OBSERVABILITY_TIMSLITE_DATA_STORE = "true";
+      fakeTimslite = makeFakeTimsliteAdapter();
+      const getManyArgs = [];
+      repoTest.setStoreFactory(() => {
+        store = createRequestDetailsStore({
+          adapter: fakeTimslite.adapter,
+          env: { OBSERVABILITY_TIMSLITE_DATA_STORE: "true" },
+        });
+        const inner = store.getMany.bind(store);
+        store.getMany = (ids, options) => {
+          getManyArgs.push({ ids, options });
+          return inner(ids, options);
+        };
+        return store;
+      });
+
+      await saveRequestDetail({ id: "write-read", request: { body: "kept" } });
+      await repoTest.flushNow();
+      const insert = mockDbAdapter.run.mock.calls.find((call) => call[0].includes("INSERT INTO requestDetails"));
+      mockDbAdapter.get.mockReturnValue({ c: 1 });
+      mockDbAdapter.all.mockReturnValue([{
+        id: "write-read",
+        timestamp: insert[1][1],
+        provider: null,
+        model: null,
+        connectionId: null,
+        status: null,
+        data: insert[1][6],
+      }]);
+
+      await getRequestDetails({ pageSize: 1 });
+      expect(getManyArgs).toHaveLength(1);
+      expect(getManyArgs[0].options).toEqual({ resolveValues: false });
+    });
+
     it("does not mutate the caller object or nested headers during flush", async () => {
       process.env.OBSERVABILITY_TIMSLITE_DATA_STORE = "true";
       fakeTimslite = makeFakeTimsliteAdapter();

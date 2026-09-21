@@ -1022,6 +1022,65 @@ describe("Message deduplication — transparent read resolution", () => {
     expect(result.get(pointer.timslite_id).__values__).toBeUndefined();
   });
 
+  it("returns parsed compact records untouched when resolveValues is false", async () => {
+    const fake = makeFakeAdapter();
+    const store = createRequestDetailsStore({
+      adapter: fake.adapter,
+      env: { OBSERVABILITY_TIMSLITE_DATA_STORE: "true" },
+    });
+    const pointer = await store.stage({ id: "a", request: { messages: [sharedMessage] } });
+    await store.flush();
+    const id = pointer.timslite_id;
+
+    const result = await store.getMany([id], { resolveValues: false });
+
+    // Compact record returned verbatim: strict refs intact, protocol array kept.
+    expect(result.get(id)).toEqual({
+      id: "a",
+      request: { messages: ["#/0/0"] },
+      __values__: [sharedMessage],
+    });
+  });
+
+  it("does not perform cross-record reads when resolveValues is false", async () => {
+    const fake = makeFakeAdapter();
+    const store = createRequestDetailsStore({
+      adapter: fake.adapter,
+      env: { OBSERVABILITY_TIMSLITE_DATA_STORE: "true" },
+    });
+    await store.stage({ id: "a", request: { messages: [sharedMessage] } });
+    await store.flush();
+    const idA = fake.calls.write[0].timestamp.toString();
+
+    // Record B holds only a cross-record ref into A.
+    await store.stage({ id: "b", request: { messages: [structuredClone(sharedMessage)] } });
+    await store.flush();
+    const idB = fake.calls.write[1].timestamp.toString();
+
+    const readsBefore = fake.calls.read.length;
+    const result = await store.getMany([idB], { resolveValues: false });
+
+    // Exactly one point read for the requested record, no read of source record A.
+    expect(fake.calls.read.length).toBe(readsBefore + 1);
+    expect(fake.calls.read[fake.calls.read.length - 1]).toBe(BigInt(idB));
+    expect(result.get(idB).request.messages).toEqual([`#/${idA}/0`]);
+    expect(result.get(idB).__values__).toBeUndefined();
+  });
+
+  it("defaults to hydrating when the options object is omitted", async () => {
+    const fake = makeFakeAdapter();
+    const store = createRequestDetailsStore({
+      adapter: fake.adapter,
+      env: { OBSERVABILITY_TIMSLITE_DATA_STORE: "true" },
+    });
+    const pointer = await store.stage({ id: "a", request: { messages: [sharedMessage] } });
+    await store.flush();
+
+    const result = await store.getMany([pointer.timslite_id]);
+    expect(result.get(pointer.timslite_id)).toEqual({ id: "a", request: { messages: [sharedMessage] } });
+    expect(result.get(pointer.timslite_id).__values__).toBeUndefined();
+  });
+
   it("rehydrates cross-record refs across a batch read", async () => {
     const fake = makeFakeAdapter();
     const store = createRequestDetailsStore({
