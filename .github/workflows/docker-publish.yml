@@ -5,166 +5,22 @@ on:
     tags:
       - "v*"
   workflow_dispatch:
-    inputs:
-      release_tag:
-        description: "Existing vX.Y.Z tag to publish"
-        required: true
-        type: string
-      promote_latest:
-        description: "Promote this republish to latest"
-        required: false
-        default: false
-        type: boolean
-
-# Keep every release in one FIFO queue. A per-tag group would still allow an
-# older release to finish after a newer release and move latest backwards.
-concurrency:
-  group: docker-publish-${{ github.repository }}
-  cancel-in-progress: false
-  queue: max
 
 env:
   DOCKERHUB_IMAGE: sujin190/9router
 
 jobs:
-  prepare:
-    name: Validate release
+  build-and-push:
     runs-on: ubuntu-latest
-    timeout-minutes: 10
-    permissions:
-      contents: read
-
-    outputs:
-      tag: ${{ steps.release.outputs.tag }}
-      version: ${{ steps.release.outputs.version }}
-      commit: ${{ steps.release.outputs.commit }}
-      publish_dockerhub: ${{ steps.release.outputs.publish_dockerhub }}
-      promote_latest: ${{ steps.release.outputs.promote_latest }}
-      ghcr_image: ${{ steps.release.outputs.ghcr_image }}
-
-    steps:
-      - name: Check out release tag
-        uses: actions/checkout@v4
-        with:
-          ref: ${{ inputs.release_tag || github.ref_name }}
-          fetch-depth: 1
-
-      - name: Validate tag and package versions
-        id: release
-        env:
-          RELEASE_TAG: ${{ inputs.release_tag || github.ref_name }}
-          REPOSITORY: ${{ github.repository }}
-          EVENT_NAME: ${{ github.event_name }}
-          PROMOTE_LATEST_INPUT: ${{ inputs.promote_latest && 'true' || 'false' }}
-        run: |
-          node <<'NODE'
-          const fs = require("fs");
-          const { execFileSync } = require("child_process");
-
-          const tag = process.env.RELEASE_TAG || "";
-          const match = /^v((?:0|[1-9]\d*)\.(?:0|[1-9]\d*)\.(?:0|[1-9]\d*)(?:-[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?)$/.exec(tag);
-
-          if (tag.includes("+")) {
-            console.error(`Build metadata is not supported in Docker release tags: ${tag}`);
-            process.exit(1);
-          }
-
-          if (!match) {
-            console.error(`Expected a Docker-safe semver tag like v0.5.81 or v0.5.81-rc.1, received: ${tag || "<empty>"}`);
-            process.exit(1);
-          }
-
-          const version = match[1];
-          if (version.length > 128 || !/^[A-Za-z0-9_][A-Za-z0-9_.-]{0,127}$/.test(version)) {
-            console.error(`Version is not a valid Docker tag: ${version}`);
-            process.exit(1);
-          }
-
-          const prerelease = version.includes("-")
-            ? version.slice(version.indexOf("-") + 1).split(".")
-            : [];
-          for (const identifier of prerelease) {
-            if (/^\d+$/.test(identifier) && identifier.length > 1 && identifier.startsWith("0")) {
-              console.error(`Numeric prerelease identifiers cannot contain leading zeroes: ${identifier}`);
-              process.exit(1);
-            }
-          }
-
-          const rootVersion = require("./package.json").version;
-          const cliVersion = require("./cli/package.json").version;
-
-          if (rootVersion !== version) {
-            console.error(`package.json version ${rootVersion} does not match tag ${tag}`);
-            process.exit(1);
-          }
-
-          if (cliVersion !== version) {
-            console.error(`cli/package.json version ${cliVersion} does not match tag ${tag}`);
-            process.exit(1);
-          }
-
-          const commit = execFileSync("git", ["rev-parse", "HEAD"], { encoding: "utf8" }).trim();
-          const publishDockerHub = process.env.REPOSITORY === "decolua/9router";
-          const ghcrImage = `ghcr.io/${process.env.REPOSITORY.toLowerCase()}`;
-          const isPrerelease = version.includes("-");
-          const promoteLatest = (process.env.EVENT_NAME === "push" && !isPrerelease)
-            || process.env.PROMOTE_LATEST_INPUT === "true";
-          const output = process.env.GITHUB_OUTPUT;
-
-          fs.appendFileSync(output, `tag=${tag}\n`);
-          fs.appendFileSync(output, `version=${version}\n`);
-          fs.appendFileSync(output, `commit=${commit}\n`);
-          fs.appendFileSync(output, `publish_dockerhub=${publishDockerHub}\n`);
-          fs.appendFileSync(output, `promote_latest=${promoteLatest}\n`);
-          fs.appendFileSync(output, `ghcr_image=${ghcrImage}\n`);
-
-          console.log(`Validated ${tag} at ${commit}`);
-          console.log(`latest promotion: ${promoteLatest ? "enabled" : "disabled"}`);
-          NODE
-
-  build:
-    name: Build ${{ matrix.platform }}
-    needs: prepare
-    runs-on: ${{ matrix.runner }}
-    timeout-minutes: 60
-    env:
-      GHCR_IMAGE: ${{ needs.prepare.outputs.ghcr_image }}
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - platform: linux/amd64
-            suffix: amd64
-            runner: ubuntu-24.04
-          - platform: linux/arm64
-            suffix: arm64
-            runner: ubuntu-24.04-arm
-
     permissions:
       contents: read
 
     steps:
-      - name: Check out release source at validated commit
-        uses: actions/checkout@v4
-        with:
-          ref: ${{ needs.prepare.outputs.commit }}
-          path: source
-          fetch-depth: 1
+      - uses: actions/checkout@v4
 
-      - name: Check out publishing Dockerfile
-        uses: actions/checkout@v4
-        with:
-          ref: ${{ github.workflow_sha }}
-          path: workflow
-          sparse-checkout: |
-            Dockerfile
-          fetch-depth: 1
-
-      - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
+      - uses: docker/setup-buildx-action@v3
 
       - name: Log in to Docker Hub
-        if: needs.prepare.outputs.publish_dockerhub == 'true'
         uses: docker/login-action@v3
         with:
           username: ${{ secrets.DOCKERHUB_USERNAME }}
