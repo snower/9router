@@ -14,6 +14,12 @@ const TRUNCATABLE_FIELDS = ["request", "providerRequest", "providerResponse", "r
 
 const DEDUP_FIELDS = ["request", "providerRequest"];
 
+// Shape policy inside each deduped container: messages/input arrays dedup per
+// element; tools (array) and instructions (string) collapse to one whole value.
+const CONTAINER_ITEM_FIELDS = ["messages", "input"];
+const CONTAINER_WHOLE_ARRAY_FIELDS = ["tools"];
+const CONTAINER_WHOLE_STRING_FIELDS = ["instructions"];
+
 const VALUES_KEY = "__values__";
 
 // Ref wire format "#/<timslite_id>/<values_index>" with both parts decimal:
@@ -85,11 +91,11 @@ export function createValueCache({ maxEntries = TIMSLITE_VALUE_CACHE_MAX_ENTRIES
       if (ttlMicroseconds <= 0n) return;
       globalEntries.delete(sha);
       globalEntries.set(sha, { ref, writtenAt: writtenAtMicros });
-      if (globalEntries.size > maxEntries) {
-        while (globalEntries.size > maxEntries - 32) {
-          const oldest = globalEntries.keys().next().value;
-          globalEntries.delete(oldest);
-        }
+      // Evict LRU entries down to exactly maxEntries. The target must never
+      // dip below 0: a negative bound would spin forever on an empty map.
+      while (globalEntries.size > maxEntries) {
+        const oldest = globalEntries.keys().next().value;
+        globalEntries.delete(oldest);
       }
     },
     get size() {
@@ -138,14 +144,48 @@ function daysToMicroseconds(days) {
   return BigInt(days) * 24n * 60n * 60n * 1_000_000n;
 }
 
-export function createMonotonicMicrosecondId(clock = Date.now) {
+// Dataset timestamps and the retention window share one unit — hundredths of a
+// second — so expired-record math compares like with like.
+function daysToHundredthsOfSecond(days) {
+  return BigInt(days) * 24n * 60n * 60n * 100n;
+}
+
+const SECONDS_TO_HUNDREDTHS = 100n;
+const MAX_SEQUENCE_PER_SECOND = 99n;
+
+// Logical id = unixSeconds * 100 + sequence, sequence 00-99. The 101st call
+// inside one wall-clock second waits (via injectable wait, defaulting to a
+// real timer) for the next second instead of throwing or overflowing into it
+// early. A clock step backwards keeps ids strictly increasing without waiting.
+export function createMonotonicCentisecondId(
+  clock = Date.now,
+  wait = (ms) => new Promise((resolve) => setTimeout(resolve, ms)),
+) {
   let lastId = 0n;
   return {
-    next() {
-      const nowMicros = BigInt(clock()) * 1000n;
-      const candidate = nowMicros > lastId ? nowMicros : lastId + 1n;
-      lastId = candidate;
-      return candidate;
+    async next() {
+      for (;;) {
+        const nowMs = BigInt(Math.floor(clock()));
+        const base = (nowMs / 1000n) * SECONDS_TO_HUNDREDTHS;
+        if (lastId < base) {
+          lastId = base;
+          return lastId;
+        }
+        if (lastId >= base + SECONDS_TO_HUNDREDTHS) {
+          if (lastId % SECONDS_TO_HUNDREDTHS < MAX_SEQUENCE_PER_SECOND) {
+            lastId += 1n;
+            return lastId;
+          }
+          const nextId = lastId + 1n;
+          await wait(Number((nextId / SECONDS_TO_HUNDREDTHS) * 1000n - nowMs));
+          continue;
+        }
+        if (lastId % SECONDS_TO_HUNDREDTHS < MAX_SEQUENCE_PER_SECOND) {
+          lastId += 1n;
+          return lastId;
+        }
+        await wait(Number((nowMs / 1000n + 1n) * 1000n - nowMs));
+      }
     },
     seedFrom(timestamp) {
       const ts = BigInt(timestamp);
@@ -218,7 +258,8 @@ function isValidDecimalId(id) {
   return typeof id === "string" && /^\d+$/.test(id);
 }
 
-// Replaces each item in request/providerRequest messages/tools with a ref.
+// Replaces request/providerRequest messages/input items and whole tools
+// arrays / instructions strings with a ref.
 // Local first occurrence: "#/0/{index}" appended to the __values__ array.
 // Cross-record cache hit: the cached full "#/{timslite_id}/{index}" string is
 // written verbatim (no local value stored).
@@ -261,9 +302,10 @@ function deduplicateMessages(original, cache) {
     const container = clone[field];
     if (!container || typeof container !== "object") continue;
 
-    // messages: per-item dedup (each element → individual ref)
-    if (Array.isArray(container.messages)) {
-      const items = container.messages;
+    // messages/input: per-item dedup (each element → individual ref)
+    for (const key of CONTAINER_ITEM_FIELDS) {
+      if (!Array.isArray(container[key])) continue;
+      const items = container[key];
       for (let i = 0; i < items.length; i += 1) {
         if (typeof items[i] === "string" && TIMSLITE_VALUE_REF_PATTERN.test(items[i])) {
           continue;
@@ -273,12 +315,22 @@ function deduplicateMessages(original, cache) {
       }
     }
 
-    // tools: whole-array dedup (entire array → single ref string)
-    if (typeof container.tools === "string" && TIMSLITE_VALUE_REF_PATTERN.test(container.tools)) {
-      // already a strict ref string — pass through
-    } else if (Array.isArray(container.tools)) {
-      const ref = resolveRef(container.tools);
-      if (ref !== undefined) container.tools = ref;
+    // tools (array) / instructions (string): whole-value dedup → single ref
+    for (const key of CONTAINER_WHOLE_ARRAY_FIELDS) {
+      const value = container[key];
+      if (typeof value === "string" && TIMSLITE_VALUE_REF_PATTERN.test(value)) {
+        // already a strict ref string — pass through
+      } else if (Array.isArray(value)) {
+        const ref = resolveRef(value);
+        if (ref !== undefined) container[key] = ref;
+      }
+    }
+    for (const key of CONTAINER_WHOLE_STRING_FIELDS) {
+      const value = container[key];
+      if (typeof value === "string" && !TIMSLITE_VALUE_REF_PATTERN.test(value)) {
+        const ref = resolveRef(value);
+        if (ref !== undefined) container[key] = ref;
+      }
     }
   }
 
@@ -301,19 +353,22 @@ async function resolveMessages(record, dataset, log) {
     const container = record[field];
     if (!container || typeof container !== "object") continue;
 
-    // messages: scan per-item refs in arrays
-    if (Array.isArray(container.messages)) {
-      for (const ref of container.messages) {
+    // messages/input: scan per-item refs in arrays
+    for (const key of CONTAINER_ITEM_FIELDS) {
+      if (!Array.isArray(container[key])) continue;
+      for (const ref of container[key]) {
         if (typeof ref !== "string") continue;
         const match = TIMSLITE_VALUE_REF_PATTERN.exec(ref);
         if (match && match[1] !== "0") crossRecordIds.add(match[1]);
       }
     }
 
-    // tools: scan whole-array ref string
-    if (typeof container.tools === "string") {
-      const match = TIMSLITE_VALUE_REF_PATTERN.exec(container.tools);
-      if (match && match[1] !== "0") crossRecordIds.add(match[1]);
+    // tools/instructions: scan whole-value ref string
+    for (const key of [...CONTAINER_WHOLE_ARRAY_FIELDS, ...CONTAINER_WHOLE_STRING_FIELDS]) {
+      if (typeof container[key] === "string") {
+        const match = TIMSLITE_VALUE_REF_PATTERN.exec(container[key]);
+        if (match && match[1] !== "0") crossRecordIds.add(match[1]);
+      }
     }
   }
 
@@ -353,9 +408,10 @@ async function resolveMessages(record, dataset, log) {
     const container = record[field];
     if (!container || typeof container !== "object") continue;
 
-    // messages: per-item resolve
-    if (Array.isArray(container.messages)) {
-      const items = container.messages;
+    // messages/input: per-item resolve
+    for (const key of CONTAINER_ITEM_FIELDS) {
+      if (!Array.isArray(container[key])) continue;
+      const items = container[key];
       for (let i = 0; i < items.length; i += 1) {
         const ref = items[i];
         if (typeof ref !== "string") continue;
@@ -366,12 +422,13 @@ async function resolveMessages(record, dataset, log) {
       }
     }
 
-    // tools: whole-array ref resolve
-    if (typeof container.tools === "string") {
-      const match = TIMSLITE_VALUE_REF_PATTERN.exec(container.tools);
+    // tools/instructions: whole-value ref resolve
+    for (const key of [...CONTAINER_WHOLE_ARRAY_FIELDS, ...CONTAINER_WHOLE_STRING_FIELDS]) {
+      if (typeof container[key] !== "string") continue;
+      const match = TIMSLITE_VALUE_REF_PATTERN.exec(container[key]);
       if (match) {
         const resolved = resolveIndex(match[1], Number(match[2]));
-        if (resolved !== undefined) container.tools = resolved;
+        if (resolved !== undefined) container[key] = resolved;
       }
     }
   }
@@ -417,15 +474,17 @@ async function createDefaultAdapter() {
   };
 }
 
-export function createRequestDetailsStore({ adapter, env = process.env, clock, logger } = {}) {
+export function createRequestDetailsStore({ adapter, env = process.env, clock, wait, logger } = {}) {
   const enabled = isTimsliteDataStoreEnabled(env);
-  const idGen = createMonotonicMicrosecondId(clock);
+  const idGen = createMonotonicCentisecondId(clock, wait);
   const retentionDays = getTimsliteRetentionDays(env);
-  const retentionWindow = daysToMicroseconds(retentionDays);
+  const retentionWindow = daysToHundredthsOfSecond(retentionDays);
   const flushIntervalMs = getTimsliteFlushIntervalMs(env);
   const log = logger || { warn: () => {} };
 
-  const crossRecordTtlMicroseconds = computeCrossRecordTtlMicroseconds(retentionWindow);
+  // The cache ages entries by wall-clock microseconds, so its budget derives
+  // from the retention days in µs, not from the dataset's seconds-x-100 window.
+  const crossRecordTtlMicroseconds = computeCrossRecordTtlMicroseconds(daysToMicroseconds(retentionDays));
   const valueCache = createValueCache({ ttlMicroseconds: crossRecordTtlMicroseconds, clock });
 
   let store = null;
@@ -447,7 +506,7 @@ export function createRequestDetailsStore({ adapter, env = process.env, clock, l
         throw new Error("Timslite store opened in read-only mode; cannot write request details");
       }
       try {
-        await store.createDataset(DATASET_NAME, DATASET_TYPE, { retentionWindow: retentionWindow, indexContinuous: false, enableJournal: false });
+        await store.createDataset(DATASET_NAME, DATASET_TYPE, { retentionWindow: retentionWindow, indexContinuous: false, enableJournal: false, timestampUnitsPerSeconds: 100 });
       } catch (err) {
         log.warn("timslite.createDataset", { error: err.message });
       }
@@ -486,7 +545,7 @@ export function createRequestDetailsStore({ adapter, env = process.env, clock, l
   async function stage(detail) {
     if (!enabled) return null;
     await initialize();
-    const id = idGen.next();
+    const id = await idGen.next();
     const cloned = structuredClone(detail);
     staged.push({ id, original: cloned });
     return { timslite_id: id.toString() };
@@ -554,9 +613,10 @@ export function createRequestDetailsStore({ adapter, env = process.env, clock, l
       const container = clone[field];
       if (!container || typeof container !== "object") continue;
 
-      // messages: per-item ref update
-      if (Array.isArray(container.messages)) {
-        const items = container.messages;
+      // messages/input: per-item ref update
+      for (const key of CONTAINER_ITEM_FIELDS) {
+        if (!Array.isArray(container[key])) continue;
+        const items = container[key];
         for (let i = 0; i < items.length; i += 1) {
           const ref = items[i];
           if (typeof ref !== "string") continue;
@@ -570,13 +630,14 @@ export function createRequestDetailsStore({ adapter, env = process.env, clock, l
         }
       }
 
-      // tools: whole-array ref string update
-      if (typeof container.tools === "string") {
-        const match = TIMSLITE_VALUE_REF_PATTERN.exec(container.tools);
+      // tools/instructions: whole-value ref string update
+      for (const key of [...CONTAINER_WHOLE_ARRAY_FIELDS, ...CONTAINER_WHOLE_STRING_FIELDS]) {
+        if (typeof container[key] !== "string") continue;
+        const match = TIMSLITE_VALUE_REF_PATTERN.exec(container[key]);
         if (match && match[1] === "0") {
           const cachedRef = refForIndex(Number(match[2]));
           if (cachedRef !== undefined) {
-            container.tools = cachedRef;
+            container[key] = cachedRef;
             modified = true;
           }
         }

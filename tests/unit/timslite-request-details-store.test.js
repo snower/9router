@@ -8,7 +8,7 @@ import {
   TIMSLITE_VALUE_REF_PATTERN,
   _resetGlobalValueCache,
   computeCrossRecordTtlMicroseconds,
-  createMonotonicMicrosecondId,
+  createMonotonicCentisecondId,
   createRequestDetailsStore,
   createValueCache,
   getTimsliteRetentionDays,
@@ -181,7 +181,7 @@ describe("Timslite request-details store", () => {
       name: "requestDetails",
       type: "raw",
     });
-    expect(fake.calls.createDataset[0].options.retentionWindow).toBe(7n * 24n * 60n * 60n * 1_000_000n);
+    expect(fake.calls.createDataset[0].options.retentionWindow).toBe(7n * 24n * 60n * 60n * 100n);
   });
 
   it("uses a custom retention when configured", async () => {
@@ -192,7 +192,7 @@ describe("Timslite request-details store", () => {
     });
     await store.stage({ id: "x" });
     await store.flush();
-    expect(fake.calls.createDataset[0].options.retentionWindow).toBe(30n * 24n * 60n * 60n * 1_000_000n);
+    expect(fake.calls.createDataset[0].options.retentionWindow).toBe(30n * 24n * 60n * 60n * 100n);
   });
 
   it("stage returns exactly { timslite_id } as a decimal string pointer with no metadata", async () => {
@@ -271,28 +271,67 @@ describe("Timslite request-details store", () => {
   });
 });
 
-describe("Monotonic microsecond IDs", () => {
-  it("generates strictly increasing decimal bigint microsecond IDs from a fixed clock", () => {
-    const idGen = createMonotonicMicrosecondId(() => 1_726_480_000_000);
-    const ids = [idGen.next().toString(), idGen.next().toString(), idGen.next().toString()];
-    expect(ids).toEqual(ids.map(() => expect.stringMatching(/^\d+$/)));
-    expect(BigInt(ids[1])).toBeGreaterThan(BigInt(ids[0]));
-    expect(BigInt(ids[2])).toBeGreaterThan(BigInt(ids[1]));
+describe("Monotonic logical IDs — seconds x 100 + sequence", () => {
+  it("generates decimal ids as unixSeconds*100 with sequence starting at 00", async () => {
+    const idGen = createMonotonicCentisecondId(() => 1_726_480_000_123, async () => {});
+    expect(await idGen.next()).toBe(172_648_000_000n);
+    expect((172_648_000_000n % 100n)).toBe(0n);
+    expect(await idGen.next()).toBe(172_648_000_001n);
+    expect(await idGen.next()).toBe(172_648_000_002n);
   });
 
-  it("remains strictly increasing even when the clock moves backward", () => {
-    let now = 2_000_000_000_000;
-    const idGen = createMonotonicMicrosecondId(() => now);
-    const first = idGen.next().toString();
-    now = 1_000_000_000_000;
-    const second = idGen.next().toString();
-    expect(BigInt(second)).toBeGreaterThan(BigInt(first));
+  it("waits for the next second on the 101st call within one second instead of throwing", async () => {
+    let nowMs = 1_726_480_000_123;
+    const waits = [];
+    const idGen = createMonotonicCentisecondId(() => nowMs, async (ms) => {
+      waits.push(ms);
+      nowMs += ms;
+    });
+    const base = 172_648_000_000n;
+    for (let i = 0; i < 100; i += 1) {
+      expect(await idGen.next()).toBe(base + BigInt(i));
+    }
+    const hundredFirst = await idGen.next();
+    expect(waits).toEqual([877]);
+    expect(hundredFirst).toBe(base + 100n);
+    expect(hundredFirst % 100n).toBe(0n);
+    expect(hundredFirst > base + 99n).toBe(true);
   });
 
-  it("produces IDs based on microsecond scaling of the clock value", () => {
-    const idGen = createMonotonicMicrosecondId(() => 1_726_480_000_000);
-    const id = idGen.next().toString();
-    expect(BigInt(id)).toBe(1_726_480_000_000_000n);
+  it("stays strictly increasing when the clock moves backward without waiting", async () => {
+    let nowMs = 2_000_000_005_000;
+    const waits = [];
+    const idGen = createMonotonicCentisecondId(() => nowMs, async (ms) => {
+      waits.push(ms);
+      nowMs += ms;
+    });
+    const first = await idGen.next();
+    nowMs = 1_999_999_995_000;
+    const second = await idGen.next();
+    expect(second).toBe(first + 1n);
+    expect(waits).toEqual([]);
+  });
+
+  it("waits for next-second boundary when clock rolls back at sequence 99 instead of overflowing", async () => {
+    const SECOND = 1_726_480_000;
+    let nowMs = (SECOND + 1) * 1000;
+    const waits = [];
+    const idGen = createMonotonicCentisecondId(() => nowMs, async (ms) => {
+      waits.push(ms);
+      nowMs += ms;
+    });
+    // Seed to ...99 (sequence cap)
+    idGen.seedFrom(BigInt(SECOND) * 100n + 99n);
+    // Roll clock back before that second
+    nowMs = (SECOND - 1) * 1000;
+
+    const id = await idGen.next();
+
+    // Should have waited for wall clock to reach the next second
+    expect(waits).toEqual([2000]);
+    // Emit exactly lastId + 1 ending in 00 (sequence 0 of next second)
+    expect(id).toBe(BigInt(SECOND) * 100n + 100n);
+    expect(id % 100n).toBe(0n);
   });
 });
 
@@ -537,7 +576,7 @@ describe("Official Timslite API adapter", () => {
     expect(fake.calls.write[0].data).toBeInstanceOf(Buffer);
   });
 
-  it("retentionWindow is in microseconds", async () => {
+  it("retentionWindow uses the same seconds-x-100 unit as logical ids", async () => {
     const fake = makeFakeAdapter();
     const store = createRequestDetailsStore({
       adapter: fake.adapter,
@@ -545,7 +584,7 @@ describe("Official Timslite API adapter", () => {
     });
     await store.stage({ id: "a" });
     await store.flush();
-    expect(fake.calls.createDataset[0].options.retentionWindow).toBe(86_400_000_000n);
+    expect(fake.calls.createDataset[0].options.retentionWindow).toBe(8_640_000n);
   });
 });
 
@@ -629,27 +668,32 @@ describe("Explicit writable-store semantics", () => {
 describe("Latest timestamp recovery", () => {
   it("first write initializes from readLatest() timestamp", async () => {
     const fake = makeFakeAdapter();
-    fake.setLatestTimestamp(1_000_000_000_000_000n);
+    fake.setLatestTimestamp(172_648_000_050n);
     const store = createRequestDetailsStore({
       adapter: fake.adapter,
       env: { OBSERVABILITY_TIMSLITE_DATA_STORE: "true" },
+      clock: () => 1_726_480_000_000,
+      wait: async () => {},
     });
     const pointer = await store.stage({ id: "a" });
-    expect(BigInt(pointer.timslite_id)).toBeGreaterThan(1_000_000_000_000_000n);
+    expect(pointer.timslite_id).toBe("172648000051");
+    expect(BigInt(pointer.timslite_id)).toBeGreaterThan(172_648_000_050n);
     expect(fake.calls.readLatest).toBe(1);
   });
 
   it("allocates strictly larger ID than readLatest()", async () => {
     const fake = makeFakeAdapter();
-    fake.setLatestTimestamp(2_000_000_000_000_000n);
+    fake.setLatestTimestamp(172_648_000_050n);
     const store = createRequestDetailsStore({
       adapter: fake.adapter,
       env: { OBSERVABILITY_TIMSLITE_DATA_STORE: "true" },
+      clock: () => 1_726_480_000_000,
+      wait: async () => {},
     });
     const p1 = await store.stage({ id: "a" });
     const p2 = await store.stage({ id: "b" });
     expect(BigInt(p2.timslite_id)).toBeGreaterThan(BigInt(p1.timslite_id));
-    expect(BigInt(p1.timslite_id)).toBeGreaterThan(2_000_000_000_000_000n);
+    expect(BigInt(p1.timslite_id)).toBeGreaterThan(172_648_000_050n);
   });
 });
 
@@ -1753,5 +1797,278 @@ describe("Deduplication protocol — tools whole-array compression", () => {
     const written = JSON.parse(fake.records.get(fake.calls.write[0].timestamp.toString()));
     expect(written.request.tools).toBe(strictRef);
     expect(written.__values__).toBeUndefined();
+  });
+});
+
+describe("Logical ID units — store integration", () => {
+  beforeEach(() => _resetGlobalValueCache());
+  const okEnv = { OBSERVABILITY_TIMSLITE_DATA_STORE: "true" };
+
+  it("stage issues pointer ids equal to unixSeconds*100+sequence from the injected clock", async () => {
+    const fake = makeFakeAdapter();
+    const store = createRequestDetailsStore({
+      adapter: fake.adapter,
+      env: okEnv,
+      clock: () => 1_726_480_000_000,
+      wait: async () => {},
+    });
+    const p1 = await store.stage({ id: "a" });
+    const p2 = await store.stage({ id: "b" });
+    expect(p1.timslite_id).toBe("172648000000");
+    expect(p2.timslite_id).toBe("172648000001");
+    await store.flush();
+    expect(fake.calls.write.map((w) => w.timestamp.toString())).toEqual(["172648000000", "172648000001"]);
+  });
+
+  it("the 101st stage in one second waits until the next second instead of throwing", async () => {
+    let nowMs = 1_726_480_000_500;
+    const waits = [];
+    const fake = makeFakeAdapter();
+    const store = createRequestDetailsStore({
+      adapter: fake.adapter,
+      env: okEnv,
+      clock: () => nowMs,
+      wait: async (ms) => {
+        waits.push(ms);
+        nowMs += ms;
+      },
+    });
+    for (let i = 0; i < 100; i += 1) {
+      const p = await store.stage({ seq: i });
+      expect(p.timslite_id).toBe(String(172_648_000_000 + i));
+    }
+    const p101 = await store.stage({ seq: 100 });
+    expect(waits).toEqual([500]);
+    expect(p101.timslite_id).toBe("172648000100");
+    await store.flush();
+    expect(fake.calls.write).toHaveLength(101);
+    expect(fake.calls.write[100].timestamp).toBe(172_648_000_100n);
+  });
+
+  it("cross-record refs embed the seconds-x-100 id of the source record", async () => {
+    const fake = makeFakeAdapter();
+    const store = createRequestDetailsStore({
+      adapter: fake.adapter,
+      env: okEnv,
+      clock: () => 1_726_480_000_000,
+      wait: async () => {},
+    });
+    const shared = { role: "user", content: "shared-unit" };
+    await store.stage({ id: "a", request: { messages: [shared] } });
+    await store.flush();
+    await store.stage({ id: "b", request: { messages: [structuredClone(shared)] } });
+    await store.flush();
+
+    const idA = fake.calls.write[0].timestamp.toString();
+    expect(idA).toBe("172648000000");
+    const second = JSON.parse(fake.records.get(fake.calls.write[1].timestamp.toString()));
+    expect(second.request.messages).toEqual([`#/${idA}/0`]);
+
+    const idB = fake.calls.write[1].timestamp.toString();
+    const result = await store.getMany([idB]);
+    expect(result.get(idB)).toEqual({ id: "b", request: { messages: [shared] } });
+  });
+});
+
+describe("Deduplication protocol — input items and instructions string", () => {
+  beforeEach(() => _resetGlobalValueCache());
+  const okEnv = { OBSERVABILITY_TIMSLITE_DATA_STORE: "true" };
+  const userMessage = { role: "user", content: "hi" };
+  const inputItemA = { type: "message", role: "user", content: [{ type: "input_text", text: "first" }] };
+  const inputItemB = { type: "function_call", call_id: "c1", name: "get_weather", arguments: "{}" };
+  const instructionsText = "You are a precise assistant.";
+  const toolsArray = [{ type: "function", function: { name: "get_time" } }];
+
+  function readWritten(fake, i = 0) {
+    return JSON.parse(fake.records.get(fake.calls.write[i].timestamp.toString()));
+  }
+
+  it("deduplicates request.input items per element into the shared __values__ array", async () => {
+    const fake = makeFakeAdapter();
+    const store = createRequestDetailsStore({ adapter: fake.adapter, env: okEnv });
+    await store.stage({ id: "a", request: { model: "gpt-5", input: [inputItemA, inputItemB] } });
+    await store.flush();
+
+    const written = readWritten(fake);
+    expect(written.request.input).toEqual(["#/0/0", "#/0/1"]);
+    expect(written.__values__).toEqual([inputItemA, inputItemB]);
+  });
+
+  it("collapses duplicate input items onto one __values__ index", async () => {
+    const fake = makeFakeAdapter();
+    const store = createRequestDetailsStore({ adapter: fake.adapter, env: okEnv });
+    await store.stage({
+      id: "a",
+      request: { input: [inputItemA, structuredClone(inputItemA)] },
+    });
+    await store.flush();
+
+    const written = readWritten(fake);
+    expect(written.request.input).toEqual(["#/0/0", "#/0/0"]);
+    expect(written.__values__).toEqual([inputItemA]);
+  });
+
+  it("deduplicates the instructions string as a single whole value", async () => {
+    const fake = makeFakeAdapter();
+    const store = createRequestDetailsStore({ adapter: fake.adapter, env: okEnv });
+    await store.stage({ id: "a", request: { model: "gpt-5", instructions: instructionsText } });
+    await store.flush();
+
+    const written = readWritten(fake);
+    expect(written.request.instructions).toBe("#/0/0");
+    expect(written.__values__).toEqual([instructionsText]);
+  });
+
+  it("shares one __values__ entry for identical instructions across request and providerRequest", async () => {
+    const fake = makeFakeAdapter();
+    const store = createRequestDetailsStore({ adapter: fake.adapter, env: okEnv });
+    await store.stage({
+      id: "a",
+      request: { instructions: instructionsText },
+      providerRequest: { instructions: instructionsText },
+    });
+    await store.flush();
+
+    const written = readWritten(fake);
+    expect(written.request.instructions).toBe("#/0/0");
+    expect(written.providerRequest.instructions).toBe("#/0/0");
+    expect(written.__values__).toEqual([instructionsText]);
+  });
+
+  it("orders first-seen indices messages, then input, then tools, then instructions in one container", async () => {
+    const fake = makeFakeAdapter();
+    const store = createRequestDetailsStore({ adapter: fake.adapter, env: okEnv });
+    await store.stage({
+      id: "a",
+      request: {
+        messages: [userMessage],
+        input: [inputItemA],
+        tools: structuredClone(toolsArray),
+        instructions: instructionsText,
+      },
+    });
+    await store.flush();
+
+    const written = readWritten(fake);
+    expect(written.request.messages).toEqual(["#/0/0"]);
+    expect(written.request.input).toEqual(["#/0/1"]);
+    expect(written.request.tools).toBe("#/0/2");
+    expect(written.request.instructions).toBe("#/0/3");
+    expect(written.__values__).toEqual([userMessage, inputItemA, toolsArray, instructionsText]);
+  });
+
+  it("rehydrates input items and instructions on getMany and strips __values__", async () => {
+    const fake = makeFakeAdapter();
+    const store = createRequestDetailsStore({ adapter: fake.adapter, env: okEnv });
+    const pointer = await store.stage({
+      id: "a",
+      request: { messages: [userMessage], input: [inputItemA, inputItemB], instructions: instructionsText },
+    });
+    await store.flush();
+
+    const detail = (await store.getMany([pointer.timslite_id])).get(pointer.timslite_id);
+    expect(detail).toEqual({
+      id: "a",
+      request: { messages: [userMessage], input: [inputItemA, inputItemB], instructions: instructionsText },
+    });
+    expect(detail.__values__).toBeUndefined();
+    expect(JSON.stringify(detail)).not.toContain("#/0/");
+  });
+
+  it("reuses identical input items and instructions from an earlier record via cross-record refs", async () => {
+    const fake = makeFakeAdapter();
+    const store = createRequestDetailsStore({ adapter: fake.adapter, env: okEnv });
+    await store.stage({ id: "a", request: { input: [inputItemA], instructions: instructionsText } });
+    await store.flush();
+    const idA = fake.calls.write[0].timestamp.toString();
+
+    await store.stage({
+      id: "b",
+      request: { input: [structuredClone(inputItemA)], instructions: instructionsText },
+    });
+    await store.flush();
+
+    const second = readWritten(fake, 1);
+    expect(second.request.input).toEqual([`#/${idA}/0`]);
+    expect(second.request.instructions).toBe(`#/${idA}/1`);
+    expect(second.__values__).toBeUndefined();
+
+    const idB = fake.calls.write[1].timestamp.toString();
+    const detail = (await store.getMany([idB])).get(idB);
+    expect(detail).toEqual({
+      id: "b",
+      request: { input: [inputItemA], instructions: instructionsText },
+    });
+  });
+
+  it("preserves existing strict ref strings in input items and instructions without re-hashing", async () => {
+    const fake = makeFakeAdapter();
+    const store = createRequestDetailsStore({ adapter: fake.adapter, env: okEnv });
+    const inputCrossRef = "#/17898773127120/2";
+    const instructionsCrossRef = "#/17898773127120/5";
+
+    await store.stage({
+      id: "a",
+      request: { input: [inputCrossRef, userMessage], instructions: instructionsCrossRef },
+    });
+    await store.flush();
+
+    const written = readWritten(fake);
+    expect(written.request.input[0]).toBe(inputCrossRef);
+    expect(written.request.input[1]).toBe("#/0/0");
+    expect(written.request.instructions).toBe(instructionsCrossRef);
+    expect(written.__values__).toEqual([userMessage]);
+  });
+
+  it("leaves non-array input and non-string instructions untouched (fail open)", async () => {
+    const fake = makeFakeAdapter();
+    const store = createRequestDetailsStore({ adapter: fake.adapter, env: okEnv });
+    await store.stage({
+      id: "a",
+      request: { input: { shape: "object" }, instructions: 42 },
+      providerRequest: { input: null },
+    });
+    await store.flush();
+
+    const written = readWritten(fake);
+    expect(written.request.input).toEqual({ shape: "object" });
+    expect(written.request.instructions).toBe(42);
+    expect(written.providerRequest.input).toBeNull();
+    expect(written.__values__).toBeUndefined();
+  });
+
+  it("returns compact input/instructions refs verbatim when resolveValues is false", async () => {
+    const fake = makeFakeAdapter();
+    const store = createRequestDetailsStore({ adapter: fake.adapter, env: okEnv });
+    const pointer = await store.stage({
+      id: "a",
+      request: { input: [inputItemA], instructions: instructionsText },
+    });
+    await store.flush();
+
+    const readsBefore = fake.calls.read.length;
+    const result = await store.getMany([pointer.timslite_id], { resolveValues: false });
+    expect(fake.calls.read.length).toBe(readsBefore + 1);
+    expect(result.get(pointer.timslite_id)).toEqual({
+      id: "a",
+      request: { input: ["#/0/0"], instructions: "#/0/1" },
+      __values__: [inputItemA, instructionsText],
+    });
+  });
+
+  it("leaves input and instructions completely untouched when the payload shadows __values__", async () => {
+    const fake = makeFakeAdapter();
+    const store = createRequestDetailsStore({ adapter: fake.adapter, env: okEnv });
+    await store.stage({
+      id: "a",
+      request: { input: [inputItemA], instructions: instructionsText },
+      __values__: { user: "pre-existing" },
+    });
+    await store.flush();
+
+    const written = readWritten(fake);
+    expect(written.request.input).toEqual([inputItemA]);
+    expect(written.request.instructions).toBe(instructionsText);
+    expect(written.__values__).toEqual({ user: "pre-existing" });
   });
 });
