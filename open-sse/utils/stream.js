@@ -135,7 +135,6 @@ export function createSSEStream(options = {}) {
     }
   };
 
-<<<<<<< HEAD
   // Terminal-error tail for an abnormal flush. Routes the accumulated snapshot
   // through the terminal-error hook (the same one-shot guard the success path
   // uses) instead of finalizeStream(), so a transform flush failure is never
@@ -184,12 +183,15 @@ export function createSSEStream(options = {}) {
   // calling finalizeStream(); it never reorders or adds writes.
   const awaitTerminalDelivery = () => new Promise((resolve) => setTimeout(resolve, 0));
 
-  const stream = new TransformStream({
-    async transform(chunk, controller) {
-=======
   // Emit the deferred response.completed now — at [DONE], or when the watchdog
-  // below gives up on a usage trailer that never arrives.
-  const flushPendingCompletion = (controller) => {
+  // below gives up on a usage trailer that never arrives. Follows the shared
+  // terminal protocol: re-entry is blocked once any outcome owns the terminal,
+  // success is claimed after the deferred bytes are enqueued, the delivery
+  // barrier is awaited before persisting, and finalizeStream() is one-shot —
+  // so [DONE] racing the watchdog can never duplicate the completion event
+  // or its usage/completion record.
+  const flushPendingCompletion = async (controller) => {
+    if (finalized || terminalEstablished) return;
     const completed = translateResponse(targetFormat, sourceFormat, null, state);
     for (const item of completed || []) {
       if (item === null || item === undefined) continue;
@@ -198,12 +200,13 @@ export function createSSEStream(options = {}) {
       controller.enqueue(sharedEncoder.encode(output));
       sseEmittedCount++;
     }
+    establishSuccessTerminal();
+    await awaitTerminalDelivery();
     finalizeStream();
   };
 
-  return new TransformStream({
-    transform(chunk, controller) {
->>>>>>> master
+  const stream = new TransformStream({
+    async transform(chunk, controller) {
       if (!ttftAt) ttftAt = Date.now();
       const text = decoder.decode(chunk, { stream: true });
       buffer += text;
@@ -377,7 +380,7 @@ export function createSSEStream(options = {}) {
           // if the upstream keeps the HTTP connection open, so finish now.
           if (targetFormat === FORMATS.OPENAI && sourceFormat === FORMATS.OPENAI_RESPONSES &&
               state.completionPending && !state.completedSent) {
-            flushPendingCompletion(controller);
+            await flushPendingCompletion(controller);
           }
 
           // Synthesize response.failed if the Responses stream never sent a terminal event
@@ -534,7 +537,7 @@ export function createSSEStream(options = {}) {
           completionFlushTimer = setTimeout(() => {
             completionFlushTimer = null;
             if (state?.completedSent) return;
-            try { flushPendingCompletion(controller); } catch { /* controller already closed */ }
+            flushPendingCompletion(controller).catch(() => { /* controller already closed */ });
           }, PENDING_COMPLETION_FLUSH_MS);
         }
       }
