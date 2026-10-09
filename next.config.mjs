@@ -25,7 +25,11 @@ const nextConfig = {
   // `require(join(__dirname, "timslite.<target>.node"))`. Bundling rewrites __dirname
   // to the chunk directory and drops the .node files, so the loader throws
   // "Cannot find timslite native binding" in every deployed standalone build.
-  serverExternalPackages: ["better-sqlite3", "sql.js", "node:sqlite", "bun:sqlite", "open", "timslite"],
+  //
+  // @aws-sdk/credential-providers must stay external for the same class of reason: it reads
+  // ~/.aws/config and the SSO token cache from disk at runtime and resolves its credential
+  // plugins by dynamic require, neither of which survives bundling.
+  serverExternalPackages: ["better-sqlite3", "sql.js", "node:sqlite", "bun:sqlite", "open", "timslite", "@aws-sdk/credential-providers"],
   turbopack: {
     root: tracingRoot
   },
