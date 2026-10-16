@@ -305,6 +305,12 @@ export function createSSEStream(options = {}) {
                 accumulatedThinking += reasoning;
               }
 
+              // OpenAI Responses API format - output text delta
+              if (parsed.type === "response.output_text.delta" && typeof parsed.delta === "string") {
+                totalContentLength += parsed.delta.length;
+                accumulatedContent += parsed.delta;
+              }
+
               const extracted = extractUsage(parsed);
               if (extracted) {
                 usage = mergeUsage(usage, extracted);
@@ -467,6 +473,12 @@ export function createSSEStream(options = {}) {
               }
             }
           }
+        }
+
+        // OpenAI Responses API format - output text delta
+        if (parsed.type === "response.output_text.delta" && typeof parsed.delta === "string") {
+          totalContentLength += parsed.delta.length;
+          accumulatedContent += parsed.delta;
         }
 
         // Extract usage
