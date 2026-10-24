@@ -2,12 +2,17 @@
 
 import { useCallback, useEffect, useState } from "react";
 import PropTypes from "prop-types";
-import { Card, Badge } from "@/shared/components";
+import { Card, Badge, Toggle } from "@/shared/components";
 import { useNotificationStore } from "@/store/notificationStore";
+import { translate } from "@/i18n/runtime";
 
 // Mirrors the server-side gate in /api/providers/[id]/overrides — client check is UX only
 const BLOCKED_HEADERS = ["host", "content-length", "content-type", "connection", "transfer-encoding", "authorization", "cookie"];
 const HEADER_NAME_RE = /^[A-Za-z0-9-]+$/;
+
+// Providers exposing the system prompt neutralization opt-out. Tencent's content
+// filter is why codebuddy-cn rewrites agent system prompts in the first place.
+const NEUTRALIZATION_PROVIDERS = new Set(["codebuddy-cn"]);
 
 export default function CustomConfigCard({ providerId }) {
   const notify = useNotificationStore();
@@ -16,6 +21,50 @@ export default function CustomConfigCard({ providerId }) {
   const [builtin, setBuiltin] = useState({});
   const [hasOverride, setHasOverride] = useState(false);
   const [saving, setSaving] = useState(false);
+  const [neutralizationEnabled, setNeutralizationEnabled] = useState(true);
+  const [neutralizationSaving, setNeutralizationSaving] = useState(false);
+  const showNeutralization = NEUTRALIZATION_PROVIDERS.has(providerId);
+
+  useEffect(() => {
+    if (!showNeutralization) return undefined;
+    let cancelled = false;
+    fetch("/api/settings", { cache: "no-store" })
+      .then((r) => (r.ok ? r.json() : null))
+      .then((data) => {
+        if (cancelled || !data) return;
+        const map = data.providerSystemPromptNeutralization || {};
+        // A missing entry means enabled; only an explicit false disables it.
+        setNeutralizationEnabled(map[providerId] !== false);
+      })
+      .catch(() => {});
+    return () => { cancelled = true; };
+  }, [providerId, showNeutralization]);
+
+  const saveNeutralization = useCallback(async (enabled) => {
+    setNeutralizationEnabled(enabled);
+    setNeutralizationSaving(true);
+    // Send only this provider's entry; the repo merges it into the stored map
+    // inside its transaction, so concurrent toggles cannot clobber each other.
+    try {
+      const saveRes = await fetch("/api/settings", {
+        method: "PATCH",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ providerSystemPromptNeutralization: { [providerId]: enabled } }),
+      });
+      if (!saveRes.ok) {
+        const err = await saveRes.json().catch(() => ({}));
+        notify.error(err.error || "Failed to save");
+        setNeutralizationEnabled(!enabled);
+        return;
+      }
+      notify.success(translate("Saved"));
+    } catch {
+      setNeutralizationEnabled(!enabled);
+      notify.error(translate("Failed to save"));
+    } finally {
+      setNeutralizationSaving(false);
+    }
+  }, [providerId, notify]);
 
   useEffect(() => {
     let cancelled = false;
@@ -84,10 +133,40 @@ export default function CustomConfigCard({ providerId }) {
   };
 
   // Only render when there is something to customize: registry headers or existing overrides
-  if (Object.keys(builtin).length === 0 && !hasOverride) return null;
+  const showHeaders = Object.keys(builtin).length > 0 || hasOverride;
+  if (!showHeaders && !showNeutralization) return null;
+
+  const neutralizationToggle = showNeutralization ? (
+    <div className="flex flex-col gap-2">
+      <Toggle
+        checked={neutralizationEnabled}
+        disabled={neutralizationSaving}
+        onChange={saveNeutralization}
+        label={translate("系统提示词兼容替换")}
+      />
+      <p className="text-xs text-text-muted">
+        {translate(
+          "Rewrites whole-system prompts over 2000 characters, or containing agent markers (e.g. \"You are Claude Code\"), into a neutral prompt so CodeBuddy CN does not refuse the request. This is a compatibility workaround only — it does not disable upstream moderation. Disabling it sends your original system prompt as-is, which may be refused upstream."
+        )}
+      </p>
+    </div>
+  ) : null;
 
   return (
     <Card padding="xs">
+      {showNeutralization && (
+        <div className="flex items-center gap-2 pb-3">
+          <span className="material-symbols-outlined text-primary text-[20px]">translate</span>
+          <span className="text-sm font-semibold">{translate("System Prompt Compatibility")}</span>
+          {!neutralizationEnabled && (
+            <Badge variant="warning" size="sm">{translate("Disabled")}</Badge>
+          )}
+        </div>
+      )}
+      {neutralizationToggle}
+      {showNeutralization && showHeaders && <div className="mt-3 border-t border-border pt-3" />}
+      {!showHeaders ? null : (
+      <>
       <button
         type="button"
         onClick={() => setExpanded((v) => !v)}
@@ -171,6 +250,8 @@ export default function CustomConfigCard({ providerId }) {
             </div>
           </div>
         </div>
+      )}
+      </>
       )}
     </Card>
   );

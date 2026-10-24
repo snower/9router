@@ -156,4 +156,22 @@ describe("forceStream provider config", { timeout: 20_000 }, () => {
     expect(executeMock).toHaveBeenCalledTimes(1);
     expect(executeMock.mock.calls[0][0].stream).toBe(true);
   });
+
+  it.each([true, false])("carries providerSystemPromptNeutralization=%s to the executor on the per-request credentials", async (flag) => {
+    const { handleChatCore } = await import("../../open-sse/handlers/chatCore.js");
+
+    await handleChatCore({ ...makeOptions(false), providerSystemPromptNeutralization: flag });
+
+    expect(executeMock).toHaveBeenCalledTimes(1);
+    expect(executeMock.mock.calls[0][0].credentials.providerSystemPromptNeutralization).toBe(flag);
+  });
+
+  it("leaves credentials untouched when no neutralization setting is supplied", async () => {
+    const { handleChatCore } = await import("../../open-sse/handlers/chatCore.js");
+
+    await handleChatCore(makeOptions(false));
+
+    expect(executeMock).toHaveBeenCalledTimes(1);
+    expect(executeMock.mock.calls[0][0].credentials).not.toHaveProperty("providerSystemPromptNeutralization");
+  });
 });
