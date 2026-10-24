@@ -383,3 +383,79 @@ describe("DB SQLite layer — public API parity", () => {
     expect(data).toHaveLength(7);
   });
 });
+
+describe("providerSystemPromptNeutralization setting + PATCH validation", () => {
+  const patch = async (body) => {
+    const { PATCH } = await import("@/app/api/settings/route.js");
+    const request = new Request("http://localhost/api/settings", {
+      method: "PATCH",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+    });
+    return PATCH(request);
+  };
+
+  it("defaults to an empty map so every provider is treated as enabled", async () => {
+    const settings = await sqliteDb.getSettings();
+    expect(settings.providerSystemPromptNeutralization).toEqual({});
+    expect(settings.providerSystemPromptNeutralization["codebuddy-cn"]).not.toBe(false);
+  });
+
+  it("persists a strictly boolean per-provider map", async () => {
+    const res = await patch({ providerSystemPromptNeutralization: { "codebuddy-cn": false } });
+    expect(res.status).toBe(200);
+    const updated = await sqliteDb.getSettings();
+    expect(updated.providerSystemPromptNeutralization).toEqual({ "codebuddy-cn": false });
+
+    const on = await patch({ providerSystemPromptNeutralization: { "codebuddy-cn": true } });
+    expect(on.status).toBe(200);
+    expect((await sqliteDb.getSettings()).providerSystemPromptNeutralization["codebuddy-cn"]).toBe(true);
+  });
+
+  it.each([
+    ["string false", { "codebuddy-cn": "false" }],
+    ["zero", { "codebuddy-cn": 0 }],
+    ["null", { "codebuddy-cn": null }],
+    ["numeric string", { "codebuddy-cn": "0" }],
+    ["nested object", { "codebuddy-cn": { enabled: false } }],
+  ])("rejects a non-boolean value (%s) with 400", async (_label, map) => {
+    const before = (await sqliteDb.getSettings()).providerSystemPromptNeutralization;
+    const res = await patch({ providerSystemPromptNeutralization: map });
+    expect(res.status).toBe(400);
+    expect((await sqliteDb.getSettings()).providerSystemPromptNeutralization).toEqual(before);
+  });
+
+  it.each([
+    ["array", [["codebuddy-cn", false]]],
+    ["string", "off"],
+    ["number", 1],
+    ["null", null],
+  ])("rejects a non-object map (%s) with 400", async (_label, value) => {
+    const res = await patch({ providerSystemPromptNeutralization: value });
+    expect(res.status).toBe(400);
+  });
+
+  // Regression: the dashboard toggle PATCHes a single-entry map
+  // ({ [providerId]: enabled }) without a preceding GET. The repo must merge the
+  // map against the current value inside its transaction, otherwise every toggle
+  // wipes the other providers' entries (and a stored `false`).
+  it("merges partial maps sequentially so other entries and false survive", async () => {
+    await patch({ providerSystemPromptNeutralization: {} });
+
+    expect((await patch({ providerSystemPromptNeutralization: { "codebuddy-cn": false } })).status).toBe(200);
+    expect((await patch({ providerSystemPromptNeutralization: { "other-provider": false } })).status).toBe(200);
+
+    let map = (await sqliteDb.getSettings()).providerSystemPromptNeutralization;
+    expect(map).toEqual({ "codebuddy-cn": false, "other-provider": false });
+
+    // Opting one provider back in must not drop the untouched `false` entry.
+    expect((await patch({ providerSystemPromptNeutralization: { "codebuddy-cn": true } })).status).toBe(200);
+    map = (await sqliteDb.getSettings()).providerSystemPromptNeutralization;
+    expect(map).toEqual({ "codebuddy-cn": true, "other-provider": false });
+
+    await sqliteDb.updateSettings({ providerSystemPromptNeutralization: { "third-provider": false } });
+    map = (await sqliteDb.getSettings()).providerSystemPromptNeutralization;
+    expect(map).toEqual({ "codebuddy-cn": true, "other-provider": false, "third-provider": false });
+    expect(map["third-provider"]).toBe(false);
+  });
+});

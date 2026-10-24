@@ -69,6 +69,9 @@ const DEFAULT_SETTINGS = {
   pxpipeTimeoutMs: 15000,
   // Per-provider user header overrides applied at dispatch: { [providerId]: { headers: {..} } }
   providerOverrides: {},
+  // Per-provider system prompt neutralization opt-out: { [providerId]: boolean }.
+  // A missing entry means enabled.
+  providerSystemPromptNeutralization: {},
 };
 
 async function readRaw() {
@@ -111,6 +114,25 @@ export async function getSettings() {
   return mergeWithDefaults(raw);
 }
 
+// Keys whose value is a per-provider map updated one provider at a time by the
+// dashboard. A plain top-level spread would replace the whole map, so a partial
+// PATCH ({ [providerId]: enabled }) silently drops every other entry.
+const PER_PROVIDER_MAP_KEYS = ["providerSystemPromptNeutralization"];
+
+function mergePerProviderMaps(current, updates) {
+  const merged = { ...updates };
+  for (const key of PER_PROVIDER_MAP_KEYS) {
+    const patch = updates[key];
+    if (!patch || typeof patch !== "object" || Array.isArray(patch)) continue;
+    const base = current[key];
+    merged[key] = {
+      ...(base && typeof base === "object" && !Array.isArray(base) ? base : {}),
+      ...patch,
+    };
+  }
+  return merged;
+}
+
 // Atomic read-merge-write inside transaction (prevents losing concurrent updates)
 export async function updateSettings(updates) {
   const db = await getAdapter();
@@ -118,7 +140,7 @@ export async function updateSettings(updates) {
   db.transaction(function () {
     const row = db.get(`SELECT data FROM settings WHERE id = 1`);
     const current = row ? parseJson(row.data, {}) : {};
-    next = { ...current, ...updates };
+    next = { ...current, ...mergePerProviderMaps(current, updates) };
     db.run(
       `INSERT INTO settings(id, data) VALUES(1, ?) ON CONFLICT(id) DO UPDATE SET data = excluded.data`,
       [stringifyJson(next)],

@@ -14,6 +14,19 @@ const SETTINGS_RESPONSE_HEADERS = {
 // Secrets must never be mass-assigned from request body (CWE-915)
 const PROTECTED_SETTING_KEYS = ["password", "mitmSudoEncrypted"];
 
+// Strict shape check for per-provider boolean maps. Anything that is not a plain
+// boolean is rejected instead of coerced, so `false` can never be lost to `||`.
+function validateProviderBooleanMap(value) {
+  if (value === null || typeof value !== "object" || Array.isArray(value)) {
+    return "must be an object";
+  }
+  for (const [providerId, enabled] of Object.entries(value)) {
+    if (!providerId) return "provider id must not be empty";
+    if (typeof enabled !== "boolean") return `value for ${providerId} must be a boolean`;
+  }
+  return null;
+}
+
 export async function GET() {
   try {
     const settings = await getSettings();
@@ -73,6 +86,16 @@ export async function PATCH(request) {
     if (Object.prototype.hasOwnProperty.call(body, "oidcClientSecret")) {
       if (!body.oidcClientSecret || !String(body.oidcClientSecret).trim()) {
         delete body.oidcClientSecret;
+      }
+    }
+
+    if (Object.prototype.hasOwnProperty.call(body, "providerSystemPromptNeutralization")) {
+      const invalid = validateProviderBooleanMap(body.providerSystemPromptNeutralization);
+      if (invalid) {
+        return NextResponse.json(
+          { error: `providerSystemPromptNeutralization ${invalid}` },
+          { status: 400 },
+        );
       }
     }
 

@@ -25,6 +25,9 @@ export class CodeBuddyExecutor extends DefaultExecutor {
     // legitimate user system prompts untouched. content may be a string or typed
     // blocks ([{type:"text",text}]) depending on the incoming client format, so
     // flatten before matching and preserve the original shape on replacement.
+    // The whole pass is skipped when the provider-wide setting is off — only this
+    // replacement is affected; forced streaming and reasoning below stay as-is.
+    const neutralizeSystemPrompts = credentials?.providerSystemPromptNeutralization !== false;
     const NEUTRAL_PROMPT = "You are a helpful AI assistant that helps with software engineering tasks.";
     const AGENT_PATTERN = /you are claude code|claude.?code.+official.+cli|anthropic.+official.+cli|anxthxropic.+official.+cli|you are (?:cursor|windsurf|cline|aider|continue|copilot|cody)|you are an? (?:ai )?(?:coding |code )?agent|cc_entrypoint\s*=\s*(?:cli|vscode|jetbrains|gui)|claude.?code.+issues|give feedback.+claude.?code|you are .{0,30}(?:powerful )?ai agent|orchestration capabilities|OhMyOpenCode|<agent-identity>|<Role>|<Behavior_Instructions>/i;
     const flatten = (content) =>
@@ -33,7 +36,7 @@ export class CodeBuddyExecutor extends DefaultExecutor {
         : Array.isArray(content)
           ? content.map((b) => (b && typeof b.text === "string" ? b.text : "")).join("\n")
           : "";
-    if (Array.isArray(transformed.messages)) {
+    if (neutralizeSystemPrompts && Array.isArray(transformed.messages)) {
       transformed.messages = transformed.messages.map((message) => {
         if (!message || message.role !== "system") return message;
         const text = flatten(message.content);
