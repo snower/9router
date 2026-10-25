@@ -18,7 +18,7 @@ const DEDUP_FIELDS = ["request", "providerRequest"];
 // element; tools (array) and instructions (string) collapse to one whole value.
 const CONTAINER_ITEM_FIELDS = ["messages", "input"];
 const CONTAINER_WHOLE_ARRAY_FIELDS = ["tools"];
-const CONTAINER_WHOLE_STRING_FIELDS = ["instructions"];
+const CONTAINER_WHOLE_STRING_FIELDS = ["instructions", "system"];
 
 const VALUES_KEY = "__values__";
 
