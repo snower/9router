@@ -142,11 +142,11 @@ export default function CustomConfigCard({ providerId }) {
         checked={neutralizationEnabled}
         disabled={neutralizationSaving}
         onChange={saveNeutralization}
-        label={translate("系统提示词兼容替换")}
+        label={translate("系统提示词兼容处理")}
       />
       <p className="text-xs text-text-muted">
         {translate(
-          "Rewrites whole-system prompts over 2000 characters, or containing agent markers (e.g. \"You are Claude Code\"), into a neutral prompt so CodeBuddy CN does not refuse the request. This is a compatibility workaround only — it does not disable upstream moderation. Disabling it sends your original system prompt as-is, which may be refused upstream."
+          "Keeps your original wording but lowers its priority: system prompts over 2000 characters, or containing agent markers (e.g. \"You are Claude Code\"), are demoted to a user message (content and metadata preserved) and a neutral system prompt is injected in their place, so CodeBuddy CN is less likely to refuse the request. This is a compatibility workaround only — it does not disable or change upstream moderation, and upstream may still refuse the demoted prompt. Disabling it sends your original system prompt as-is, which may be refused upstream."
         )}
       </p>
     </div>

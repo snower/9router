@@ -21,12 +21,13 @@ export class CodeBuddyExecutor extends DefaultExecutor {
     // Tencent's content filter flags CLI agent system prompts ("You are Claude
     // Code, Anthropic's official CLI...") as prompt injection / sensitive content
     // and rejects the whole request. Detect agent system prompts (length catch-all
-    // + identity-marker regex) and replace them with a neutral one, while leaving
-    // legitimate user system prompts untouched. content may be a string or typed
-    // blocks ([{type:"text",text}]) depending on the incoming client format, so
-    // flatten before matching and preserve the original shape on replacement.
-    // The whole pass is skipped when the provider-wide setting is off — only this
-    // replacement is affected; forced streaming and reasoning below stay as-is.
+    // + identity-marker regex) and demote each one to a user turn that keeps its
+    // original text and metadata verbatim, injecting a single neutral system prompt
+    // just before the first demoted one so the wording survives but drops below
+    // system priority. Legitimate user system prompts and non-system roles are left
+    // untouched, and the caller's message objects are never mutated. The whole pass
+    // is skipped when the provider-wide setting is off; forced streaming and
+    // reasoning below stay as-is.
     const neutralizeSystemPrompts = credentials?.providerSystemPromptNeutralization !== false;
     const NEUTRAL_PROMPT = "You are a helpful AI assistant that helps with software engineering tasks.";
     const AGENT_PATTERN = /you are claude code|claude.?code.+official.+cli|anthropic.+official.+cli|anxthxropic.+official.+cli|you are (?:cursor|windsurf|cline|aider|continue|copilot|cody)|you are an? (?:ai )?(?:coding |code )?agent|cc_entrypoint\s*=\s*(?:cli|vscode|jetbrains|gui)|claude.?code.+issues|give feedback.+claude.?code|you are .{0,30}(?:powerful )?ai agent|orchestration capabilities|OhMyOpenCode|<agent-identity>|<Role>|<Behavior_Instructions>/i;
@@ -37,17 +38,21 @@ export class CodeBuddyExecutor extends DefaultExecutor {
           ? content.map((b) => (b && typeof b.text === "string" ? b.text : "")).join("\n")
           : "";
     if (neutralizeSystemPrompts && Array.isArray(transformed.messages)) {
-      transformed.messages = transformed.messages.map((message) => {
+      let firstMatchIndex = -1;
+      const demoted = transformed.messages.map((message, index) => {
         if (!message || message.role !== "system") return message;
         const text = flatten(message.content);
         if (!text) return message;
         if (text.length > 2000 || AGENT_PATTERN.test(text)) {
-          return typeof message.content === "string"
-            ? { ...message, content: NEUTRAL_PROMPT }
-            : { ...message, content: [{ type: "text", text: NEUTRAL_PROMPT }] };
+          if (firstMatchIndex === -1) firstMatchIndex = index;
+          return { ...message, role: "user" };
         }
         return message;
       });
+      if (firstMatchIndex !== -1) {
+        demoted.splice(firstMatchIndex, 0, { role: "system", content: NEUTRAL_PROMPT });
+      }
+      transformed.messages = demoted;
     }
 
     // CodeBuddy only surfaces model reasoning when the request carries the CLI's

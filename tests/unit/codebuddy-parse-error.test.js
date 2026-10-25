@@ -53,6 +53,8 @@ describe("CodeBuddy CN system prompt neutralization setting", () => {
   const LONG_PROMPT = `You are Claude Code, Anthropic's official CLI for Claude. ${"x".repeat(2100)}`;
   const SHORT_AGENT_PROMPT = "You are Claude Code, Anthropic's official CLI for Claude.";
   const USER_PROMPT = "Reply in French and keep every answer under 20 words.";
+  // Mirrors the executor's neutral marker exactly; the original text must survive as a user turn.
+  const NEUTRAL_PROMPT = "You are a helpful AI assistant that helps with software engineering tasks.";
 
   const transform = (systemPrompt, flag) => {
     const executor = new CodeBuddyExecutor();
@@ -71,14 +73,81 @@ describe("CodeBuddy CN system prompt neutralization setting", () => {
     return transformed;
   };
 
+  const transformMsgs = (messages, flag) => {
+    const executor = new CodeBuddyExecutor();
+    return executor.transformRequest(
+      "claude-sonnet-4.5",
+      { messages },
+      false,
+      flag === undefined ? {} : { providerSystemPromptNeutralization: flag },
+    );
+  };
+
   it("neutralizes long and agent-marker system prompts when the flag is absent (default enabled)", () => {
     for (const prompt of [LONG_PROMPT, SHORT_AGENT_PROMPT]) {
       const defaulted = transform(prompt);
       const explicitTrue = transform(prompt, true);
-      expect(defaulted.messages[0].content).not.toBe(prompt);
-      expect(defaulted.messages[0].content).not.toContain("Anthropic's official CLI");
-      expect(explicitTrue.messages[0].content).toBe(defaulted.messages[0].content);
+
+      expect(defaulted.messages).toHaveLength(3);
+      expect(defaulted.messages[0]).toEqual({ role: "system", content: NEUTRAL_PROMPT });
+      expect(defaulted.messages.filter((m) => m.role === "system" && m.content === NEUTRAL_PROMPT)).toHaveLength(1);
+      expect(defaulted.messages[1]).toEqual({ role: "user", content: prompt });
+      expect(defaulted.messages[2]).toEqual({ role: "user", content: "hello" });
+      expect(defaulted.messages[1].content).toContain("Anthropic's official CLI");
+      expect(explicitTrue.messages).toEqual(defaulted.messages);
     }
+  });
+
+  it("injects the neutral system once before the first match and preserves original order across mixed history", () => {
+    const matchedSecond = `${SHORT_AGENT_PROMPT}`;
+    const matchedFifth = `agent ${SHORT_AGENT_PROMPT}`;
+    const messages = [
+      { role: "user", content: "hi" },
+      { role: "system", content: matchedSecond },
+      { role: "assistant", content: "ok" },
+      { role: "system", content: USER_PROMPT },
+      { role: "system", content: matchedFifth },
+    ];
+    const t = transformMsgs(messages);
+    expect(t.messages).toEqual([
+      { role: "user", content: "hi" },
+      { role: "system", content: NEUTRAL_PROMPT },
+      { role: "user", content: matchedSecond },
+      { role: "assistant", content: "ok" },
+      { role: "system", content: USER_PROMPT },
+      { role: "user", content: matchedFifth },
+    ]);
+    expect(t.messages.filter((m) => m.role === "system" && m.content === NEUTRAL_PROMPT)).toHaveLength(1);
+  });
+
+  it("demotes typed-block system prompts while preserving the exact block objects", () => {
+    const blocks = [{ type: "text", text: SHORT_AGENT_PROMPT }];
+    const t = transformMsgs([{ role: "system", content: blocks }, { role: "user", content: "hi" }]);
+    expect(t.messages[0]).toEqual({ role: "system", content: NEUTRAL_PROMPT });
+    expect(t.messages[1].role).toBe("user");
+    expect(t.messages[1].content).toBe(blocks);
+    expect(t.messages[1].content).toEqual(blocks);
+  });
+
+  it("applies the >2000 length boundary exactly (2000 kept as system, 2001 demoted)", () => {
+    const exact = "x".repeat(2000);
+    const over = "x".repeat(2001);
+    const kept = transformMsgs([{ role: "system", content: exact }]);
+    expect(kept.messages).toHaveLength(1);
+    expect(kept.messages[0]).toEqual({ role: "system", content: exact });
+
+    const demoted = transformMsgs([{ role: "system", content: over }]);
+    expect(demoted.messages).toHaveLength(2);
+    expect(demoted.messages[0]).toEqual({ role: "system", content: NEUTRAL_PROMPT });
+    expect(demoted.messages[1]).toEqual({ role: "user", content: over });
+  });
+
+  it("preserves message metadata when demoting a matched system prompt to user", () => {
+    const sys = { role: "system", name: "agent-ctx", cache_control: { type: "ephemeral" }, content: SHORT_AGENT_PROMPT };
+    const t = transformMsgs([sys]);
+    expect(t.messages[0]).toEqual({ role: "system", content: NEUTRAL_PROMPT });
+    expect(t.messages[1]).toEqual({ role: "user", name: "agent-ctx", cache_control: { type: "ephemeral" }, content: SHORT_AGENT_PROMPT });
+    expect(t.messages[1]).not.toBe(sys);
   });
 
   it("preserves long and agent-marker system prompts untouched when the flag is false", () => {
@@ -137,15 +206,20 @@ describe("CodeBuddy CN system prompt neutralization setting", () => {
     expect(none.reasoning_summary).toBeUndefined();
   });
 
-  it("does not mutate the caller's body or leak state across requests", () => {
+  it("does not mutate the caller's message objects or leak state across requests", () => {
     const executor = new CodeBuddyExecutor();
-    const body = { messages: [{ role: "system", content: LONG_PROMPT }] };
+    const sys = { role: "system", content: LONG_PROMPT };
+    const body = { messages: [sys] };
     executor.transformRequest("m", body, false, { providerSystemPromptNeutralization: false });
+    expect(sys).toEqual({ role: "system", content: LONG_PROMPT });
     expect(body.messages[0].content).toBe(LONG_PROMPT);
 
     // A disabled request must not switch neutralization off for the next one.
     executor.transformRequest("m", body, false, { providerSystemPromptNeutralization: false });
     const after = executor.transformRequest("m", body, false, {});
-    expect(after.messages[0].content).not.toBe(LONG_PROMPT);
+    expect(sys).toEqual({ role: "system", content: LONG_PROMPT });
+    expect(after.messages[0]).toEqual({ role: "system", content: NEUTRAL_PROMPT });
+    expect(after.messages[1]).toEqual({ role: "user", content: LONG_PROMPT });
+    expect(after.messages[1]).not.toBe(sys);
   });
 });
